@@ -1,0 +1,33 @@
+[package]
+name = "ce-drive-core"
+version = "0.1.0"
+edition = "2024"
+description = "CE Drive core — the Kleppmann move-CRDT directory tree, content-addressed chunked storage, capability sharing, durability, and audit. A pure library over CE primitives (ce-coord, ce-rs, ce-cap, rdev::chunk). Compiles to WASM."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-drive"
+
+[lib]
+name = "ce_drive_core"
+path = "src/lib.rs"
+
+[dependencies]
+# --- CE substrate (siblings in the ~/ce-net workspace; by path) ---
+ce-rs = { path = "../../../ce-rs" }                      # blob/object data layer + mesh transport
+ce-coord = { path = "../../../ce-coord" }                # Replicated<S> / StateMachine engine
+ce-cap = { path = "../../../ce/crates/ce-cap" }          # capability verifier (sharing/authorization)
+ce-identity = { path = "../../../ce/crates/ce-identity" } # Ed25519 identity (workspace root key)
+rdev = { path = "../../../rdev" }                        # the chunk/CID delta engine (chunk + delta)
+
+# --- async + error + serde ---
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+hex = "0.4"
+sha2 = "0.10"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+ce-identity = { path = "../../../ce/crates/ce-identity" }

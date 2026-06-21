@@ -1,0 +1,33 @@
+[package]
+name = "ce-drive-cli"
+version = "0.1.0"
+edition = "2024"
+description = "The `ce-drive` CLI — init/add/ls/tree/mv/rm/history/share/sync over ce-drive-core."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-drive"
+
+[[bin]]
+name = "ce-drive"
+path = "src/main.rs"
+
+[features]
+# Off by default so the CLI builds without libfuse (e.g. on macOS). Enable on Linux with libfuse:
+# `cargo build -p ce-drive-cli --features fuse` to get a real kernel mount for `ce-drive mount`.
+default = []
+fuse = ["ce-drive-mount/fuse"]
+
+[dependencies]
+ce-drive-core = { path = "../ce-drive-core" }
+ce-drive-mount = { path = "../ce-drive-mount" }
+ce-rs = { path = "../../../ce-rs" }
+ce-identity = { path = "../../../ce/crates/ce-identity" }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs-next = "2"

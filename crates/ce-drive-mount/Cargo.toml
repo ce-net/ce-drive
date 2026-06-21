@@ -1,0 +1,36 @@
+[package]
+name = "ce-drive-mount"
+version = "0.1.0"
+edition = "2024"
+description = "CE Drive mount (Face 1) — the developer filesystem. A shared VFS engine (lazy block hydration, write-back cache with async upload, stable inodes, readdirplus, atomic rename, attr/entry TTLs) plus per-OS adapters (fuser Linux behind the `fuse` feature; macFUSE-FSKit and WinFsp/ProjFS stubs) and a driverless `materialize` fallback that works everywhere with no kernel driver."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-drive"
+
+[lib]
+name = "ce_drive_mount"
+path = "src/lib.rs"
+
+[features]
+# Off by default so `cargo build` is green on machines without libfuse (e.g. this mac).
+# Enable on Linux with libfuse installed: `cargo build --features fuse`.
+default = []
+fuse = ["dep:fuser", "dep:libc"]
+
+[dependencies]
+# --- CE Drive core (the DriveTree + content map + store we mount) ---
+ce-drive-core = { path = "../ce-drive-core" }
+ce-rs = { path = "../../../ce-rs" }
+
+# --- async + error + serde + logging ---
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "fs"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+# --- fuser Linux adapter (feature-gated so the workspace builds without libfuse) ---
+fuser = { version = "0.14", optional = true }
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
