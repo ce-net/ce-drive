@@ -55,9 +55,11 @@ fn ce_binary() -> Option<PathBuf> {
             return Some(p);
         }
     }
+    // The executable is `ce` on Unix and `ce.exe` on Windows.
+    let exe = if cfg!(windows) { "ce.exe" } else { "ce" };
     let candidates = [
-        "/Users/07lead01/ce-net/.cargo-shared/release/ce",
-        "/Users/07lead01/ce-net/ce/target/release/ce",
+        format!("/Users/07lead01/ce-net/.cargo-shared/release/{exe}"),
+        format!("/Users/07lead01/ce-net/ce/target/release/{exe}"),
     ];
     for c in candidates {
         let p = PathBuf::from(c);
