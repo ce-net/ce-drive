@@ -11,10 +11,18 @@ name = "ce_drive_mount"
 path = "src/lib.rs"
 
 [features]
-# Off by default so `cargo build` is green on machines without libfuse (e.g. this mac).
-# Enable on Linux with libfuse installed: `cargo build --features fuse`.
+# Off by default so `cargo build` is green on machines without a FUSE provider installed
+# (e.g. this mac, a libfuse-less Linux box). Each kernel adapter is opt-in:
+#   Linux  : `cargo build --features fuse`         (needs libfuse / fusermount)
+#   macOS  : `cargo build --features macos-fskit`  (needs macFUSE 5.x with the FSKit backend)
+# Windows ProjFS/WinFsp adapters are `cfg(windows)`-gated (no extra feature needed) but only
+# compile on a Windows host.
 default = []
 fuse = ["dep:fuser", "dep:libc"]
+# macOS macFUSE backend (the design's FSKit user-space backend, `-o backend=fskit`). On macOS the
+# `fuser` crate links macFUSE via pkg-config (`osxfuse`/`macfuse`), so this feature only builds with
+# macFUSE installed; without it the default build stays green and callers use `materialize`.
+macos-fskit = ["dep:fuser", "dep:libc"]
 
 [dependencies]
 # --- CE Drive core (the DriveTree + content map + store we mount) ---
@@ -28,9 +36,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 
-# --- fuser Linux adapter (feature-gated so the workspace builds without libfuse) ---
+# --- fuser adapter (Linux libfuse-ABI + macOS macFUSE; feature-gated so the default build needs no
+#     FUSE provider) ---
 fuser = { version = "0.14", optional = true }
 libc = { version = "0.2", optional = true }
+
+# --- Windows adapters (cfg(windows)-gated; never built on non-Windows hosts) ---
+[target.'cfg(windows)'.dependencies]
+winfsp = { version = "0.13", optional = true }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Storage_ProjectedFileSystem",
+    "Win32_System_Com",
+], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

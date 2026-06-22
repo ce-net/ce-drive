@@ -14,7 +14,9 @@
 //! - audit v1 reads CE's on-chain capability grant/revoke facts ([`audit`]).
 //!
 //! Milestones covered here: **M1** (`tree` + `content` + `store` + the single-writer [`drive::Drive`]
-//! handle) and **M2** (`share` + `durability` + `audit`).
+//! handle), **M2** (`share` + `durability` + `audit`), and **multi-writer sync** ([`sync`]): the
+//! [`sync::SyncedDrive`] handle promotes the tree + content map off single-writer onto ce-coord's
+//! `Merged`, so N devices each append to their own writer log and all converge leaderless.
 //!
 //! ## Standards
 //! Edition 2024, `anyhow::Result`, `tracing` (no `println!` in the library), no `unsafe`, no
@@ -27,6 +29,7 @@ pub mod drive;
 pub mod durability;
 pub mod share;
 pub mod store;
+pub mod sync;
 pub mod tree;
 
 // Re-export the most-used types at the crate root for ergonomic downstream use.
@@ -35,6 +38,7 @@ pub use drive::{Drive, DriveState, DirEntry};
 pub use durability::{Durability, PinPolicy, PinStatus};
 pub use share::{Ability, Grant, Workspace};
 pub use store::{Store, StoredFile};
+pub use sync::{ContentMerge, StampedContentOp, SyncedDrive, TreeMerge};
 pub use tree::{DriveTree, MoveOp, NodeId, NodeKind, ROOT, TRASH, Timestamp};
 
 pub use audit::{Audit, AuditEntry, AuditJournal, GrantRecord, RevokeRecord};

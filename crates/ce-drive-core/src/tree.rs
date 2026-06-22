@@ -357,6 +357,14 @@ impl DriveTree {
     pub fn log_len(&self) -> usize {
         self.log.len()
     }
+
+    /// The greatest [`Timestamp`] in the move log (the causal frontier), or `None` if empty. Used by
+    /// the multi-writer layer to advance its Lamport clock past everything observed before minting a
+    /// new local op (so its op strictly post-dates every op it has seen).
+    pub fn log_max_ts(&self) -> Option<Timestamp> {
+        // The log is kept sorted ascending by ts, so the last entry carries the maximum.
+        self.log.last().map(|e| e.op.ts.clone())
+    }
 }
 
 /// Short (8-hex) form of a replica id for conflict-rename rendering.

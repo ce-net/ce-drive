@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ce-drive-core", "crates/ce-drive-cli", "crates/ce-drive-mount"]
+members = ["crates/ce-drive-core", "crates/ce-drive-wasm", "crates/ce-drive-cli", "crates/ce-drive-mount"]
 
 # ce-coord and rdev both depend on `ce-rs` (and ce-cap) by **git**; we depend on them by **path**.
 # Without this patch the git copy of `ce-rs` and our path copy are two distinct crates, so a

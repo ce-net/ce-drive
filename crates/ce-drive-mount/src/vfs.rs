@@ -241,6 +241,27 @@ impl<S: BlockStore> Vfs<S> {
         Self::attr_of_locked(&g, ino)
     }
 
+    /// Resolve an absolute slash-separated path to its (stable inode, attributes) — pure manifest
+    /// read, never downloads bytes. The path-addressed counterpart to [`Vfs::lookup`], needed by the
+    /// Windows adapters (WinFsp/ProjFS speak whole paths, not parent-inode + name). `"/"` is the root.
+    pub async fn lookup_path(&self, path: &str) -> Result<Attr> {
+        let mut g = self.inner.lock().await;
+        if path == "/" || path.is_empty() {
+            return Self::attr_of_locked(&g, ROOT_INO);
+        }
+        let node = g.drive.tree().resolve(path).ok_or_else(|| anyhow!("no such entry '{path}'"))?;
+        let ino = Self::intern(&mut g, &node);
+        Self::attr_of_locked(&g, ino)
+    }
+
+    /// Path-addressed [`Vfs::readdirplus`] — list a directory's children (names + full attributes,
+    /// no bytes) by absolute slash-path. The path-addressed counterpart needed by the Windows ProjFS
+    /// adapter (ProjFS enumeration callbacks speak whole paths, not parent inodes). `"/"` is the root.
+    pub async fn readdirplus_path(&self, path: &str) -> Result<Vec<DirEntryPlus>> {
+        let ino = self.lookup_path(path).await?.ino;
+        self.readdirplus(ino).await
+    }
+
     /// `readdir` — names only (the cheap variant). Sorted, conflict-renamed by the tree.
     pub async fn readdir(&self, ino: Ino) -> Result<Vec<(String, Ino, bool)>> {
         let mut g = self.inner.lock().await;
