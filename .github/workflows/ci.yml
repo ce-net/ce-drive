@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout ce-drive
+        uses: actions/checkout@v4
+        with:
+          path: ce-drive
+
+      # Path dependency: ce-drive crates depend on ../../../ce-rs (sibling of ce-drive)
+      - name: Checkout ce-rs
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-rs
+          path: ce-rs
+
+      # Path dependency: ce-drive-core depends on ../../../ce-coord
+      - name: Checkout ce-coord
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-coord
+          path: ce-coord
+
+      # Path dependency: ce-drive-core depends on ../../../rdev (chunk/CID delta engine)
+      - name: Checkout rdev
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/rdev
+          path: rdev
+
+      # Path dependency: ce-cap + ce-container + ce-identity live inside ce-net/ce
+      - name: Checkout ce
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce
+          path: ce
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ce-drive
+
+      - name: Build
+        working-directory: ce-drive
+        run: cargo build --all --verbose
+
+      - name: Test
+        working-directory: ce-drive
+        run: cargo test --all --verbose

@@ -43,10 +43,29 @@ impl Drop for Node {
     }
 }
 
-/// Locate the release `ce` binary (the task pins it to ce/target/release/ce).
+/// Locate the release `ce` binary. The workspace uses a shared cargo target dir
+/// (`~/ce-net/.cargo-shared`), so the release binary lands at `.cargo-shared/release/ce`, not the
+/// per-crate `ce/target/release/ce`. We probe (in order): `$CE_BIN`, the shared target dir, the
+/// legacy per-crate path, and finally `ce` on `$PATH`. Returns `None` if none exist (the test then
+/// self-skips with a SKIP line, keeping the pure-unit suite green where no node binary is present).
 fn ce_binary() -> Option<PathBuf> {
-    let p = PathBuf::from("/Users/07lead01/ce-net/ce/target/release/ce");
-    if p.exists() { Some(p) } else { None }
+    if let Ok(p) = std::env::var("CE_BIN") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let candidates = [
+        "/Users/07lead01/ce-net/.cargo-shared/release/ce",
+        "/Users/07lead01/ce-net/ce/target/release/ce",
+    ];
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Spawn one ephemeral node. `bootstrap` is an optional multiaddr to dial (node B dials node A).

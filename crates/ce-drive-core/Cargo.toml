@@ -30,6 +30,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
 ce-identity = { path = "../../../ce/crates/ce-identity" }
 # The two-node sync integration test boots real nodes and fetches /bootstrap over HTTP. Same feature
 # set as ce-rs so the reqwest build unifies.

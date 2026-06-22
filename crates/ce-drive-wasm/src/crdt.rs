@@ -490,6 +490,7 @@ impl ContentMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn mv(l: u64, r: &str, child: &str, parent: &str, name: &str, kind: NodeKind) -> MoveOp {
         MoveOp { ts: Timestamp::new(l, r), child: child.into(), new_parent: parent.into(), new_name: name.into(), kind }
@@ -507,8 +508,105 @@ mod tests {
         t
     }
 
+    fn fold_order(ops: &[MoveOp], order: &[usize]) -> DriveTree {
+        let mut t = DriveTree::new();
+        for &i in order {
+            t.apply(ops[i].clone());
+        }
+        t
+    }
+
     fn paths(t: &DriveTree) -> BTreeMap<String, Option<String>> {
         t.edges().keys().map(|n| (n.clone(), t.path(n))).collect()
+    }
+
+    /// True if `start` is part of a cycle: walking parent pointers revisits `start`. A bounded walk
+    /// (by edge count) catches any cycle the cycle-skip should have prevented.
+    fn walk_cycles(t: &DriveTree, start: &str) -> bool {
+        let mut cur = match t.edge(start) {
+            Some(e) => e.parent.clone(),
+            None => return false,
+        };
+        for _ in 0..=t.edges().len() {
+            if cur == start {
+                return true; // returned to start => cycle
+            }
+            match t.edge(&cur) {
+                Some(e) => cur = e.parent.clone(),
+                None => return false, // reached ROOT/TRASH/limbo without revisiting start
+            }
+        }
+        false
+    }
+
+    // -- property generators (identical shape to core's tree_proptest, so the two crates' CRDTs are
+    //    proven to converge under the same families of op streams) --
+    fn op_set_strategy() -> impl Strategy<Value = Vec<MoveOp>> {
+        let one = (any::<bool>(), 0usize..8, 0usize..10, 0usize..4, 0usize..3);
+        proptest::collection::vec(one, 1..40).prop_map(|raw| {
+            let replicas = ["aaaaaaaa", "bbbbbbbb", "cccccccc"];
+            raw.into_iter()
+                .enumerate()
+                .map(|(i, (is_dir, child_i, parent_c, name_i, rep_i))| MoveOp {
+                    ts: Timestamp::new(i as u64 + 1, replicas[rep_i]),
+                    child: format!("n{child_i}"),
+                    new_parent: match parent_c {
+                        0 => ROOT.to_string(),
+                        1 => TRASH.to_string(),
+                        o => format!("n{}", o - 2),
+                    },
+                    new_name: format!("name{name_i}"),
+                    kind: if is_dir { NodeKind::Dir } else { NodeKind::File },
+                })
+                .collect()
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 300, ..ProptestConfig::default() })]
+
+        /// The wasm CRDT converges identically across delivery orders (same guarantee as core).
+        #[test]
+        fn wasm_tree_converges_regardless_of_order(ops in op_set_strategy()) {
+            let n = ops.len();
+            let reference = paths(&fold_order(&ops, &(0..n).collect::<Vec<_>>()));
+            let rev: Vec<usize> = (0..n).rev().collect();
+            prop_assert_eq!(paths(&fold_order(&ops, &rev)), reference.clone(), "reverse delivery diverged");
+            // A rotation too.
+            let mut rot: Vec<usize> = (0..n).collect();
+            rot.rotate_left(n / 2);
+            prop_assert_eq!(paths(&fold_order(&ops, &rot)), reference, "rotated delivery diverged");
+        }
+
+        /// Idempotent + acyclic, same as core. The true invariant is ACYCLICITY: walking parent
+        /// pointers from any node must terminate without revisiting that node. (A node may legitimately
+        /// be parented under a never-created id — "limbo" — which the random generator can produce but
+        /// the real Drive API cannot; such a node has no path to ROOT yet is still acyclic, so we test
+        /// no-cycle directly rather than reachability-to-ROOT.)
+        #[test]
+        fn wasm_tree_idempotent_and_acyclic(ops in op_set_strategy()) {
+            let once = fold_tree(&ops);
+            let mut twice = once.clone();
+            for op in &ops {
+                twice.apply(op.clone());
+            }
+            prop_assert_eq!(paths(&twice), paths(&once), "duplicate delivery changed state");
+            for node in once.edges().keys() {
+                prop_assert!(!walk_cycles(&once, node), "node {} is part of a parent-pointer cycle", node);
+            }
+        }
+
+        /// WIRE PARITY: a MoveOp serialized here decodes back here identically (byte-stable JSON), the
+        /// property the design's golden-vector parity with core depends on.
+        #[test]
+        fn wasm_moveop_wire_stable(ops in op_set_strategy()) {
+            for op in &ops {
+                let bytes = serde_json::to_vec(op).unwrap();
+                let back: MoveOp = serde_json::from_slice(&bytes).unwrap();
+                prop_assert_eq!(&back, op);
+                prop_assert_eq!(serde_json::to_vec(&back).unwrap(), bytes);
+            }
+        }
     }
 
     #[test]

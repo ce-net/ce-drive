@@ -29,3 +29,5 @@ default = ["console_error_panic_hook"]
 [dev-dependencies]
 # Run the wasm-bindgen tests in a headless browser / node when available; host unit tests need none.
 wasm-bindgen-test = "0.3"
+# Property-based convergence/parity tests for the pure CRDT (host-side `cargo test`, not wasm).
+proptest = "1"

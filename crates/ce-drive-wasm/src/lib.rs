@@ -435,4 +435,43 @@ mod tests {
         let back: StampedContentOp = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(serde_json::to_vec(&back).unwrap(), bytes);
     }
+
+    /// CROSS-CRATE PARITY: the exact golden JSON strings pinned in `ce-drive-core`'s `wire_golden.rs`
+    /// must encode here byte-for-byte. If core and wasm ever disagree on field names/shape, one of
+    /// these two mirrored tests fails — so an op produced by the Rust core decodes and applies in the
+    /// browser CRDT and vice versa (the design's golden-vector parity requirement).
+    #[test]
+    fn wasm_wire_golden_matches_core() {
+        // These literals are duplicated verbatim from ce-drive-core::tests::wire_golden — by design,
+        // since the two crates cannot share a dependency. They are the inter-crate wire contract.
+        const GOLDEN_MOVE_OP: &str =
+            r#"{"ts":{"lamport":7,"replica":"node-abc"},"child":"c1","new_parent":"ROOT","new_name":"x","kind":"File"}"#;
+        const GOLDEN_CONTENT_OP: &str =
+            r#"{"ts":{"lamport":3,"replica":"node-xyz"},"op":{"Set":{"id":"c1","cid":"cidA","size":10,"mode":420,"mtime_ms":99}}}"#;
+
+        let mv = MoveOp {
+            ts: Timestamp::new(7, "node-abc"),
+            child: "c1".into(),
+            new_parent: ROOT.into(),
+            new_name: "x".into(),
+            kind: NodeKind::File,
+        };
+        assert_eq!(serde_json::to_string(&mv).unwrap(), GOLDEN_MOVE_OP, "wasm MoveOp wire drifted from core");
+        // The golden string from core decodes here and applies (proving an op minted by the Rust core
+        // is consumable by the browser CRDT).
+        let mut tree = DriveTree::new();
+        let decoded: MoveOp = serde_json::from_str(GOLDEN_MOVE_OP).unwrap();
+        tree.apply(decoded);
+        assert!(tree.path("c1").is_some(), "core-minted op applied in the wasm tree");
+
+        let content = StampedContentOp {
+            ts: Timestamp::new(3, "node-xyz"),
+            op: ContentOp::Set { id: "c1".into(), cid: "cidA".into(), size: 10, mode: 0o644, mtime_ms: 99 },
+        };
+        assert_eq!(serde_json::to_string(&content).unwrap(), GOLDEN_CONTENT_OP, "wasm ContentOp wire drifted from core");
+        let decoded_c: StampedContentOp = serde_json::from_str(GOLDEN_CONTENT_OP).unwrap();
+        let mut cm = ContentMap::new();
+        cm.apply(decoded_c.op);
+        assert_eq!(cm.get("c1").unwrap().cid, "cidA", "core-minted content op applied in wasm map");
+    }
 }
