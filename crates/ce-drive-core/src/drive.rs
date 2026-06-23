@@ -16,6 +16,7 @@ use ce_coord::StateMachine;
 use serde::{Deserialize, Serialize};
 
 use crate::content::{ContentMap, ContentOp, FileContent};
+use crate::sync::StampedContentOp;
 use crate::tree::{DriveTree, MoveOp, NodeKind, ROOT, TRASH, Timestamp};
 
 fn now_ms() -> u64 {
@@ -31,6 +32,20 @@ fn fresh_node_id(lamport: u64) -> String {
     format!("{lamport:012x}{c:08x}")
 }
 
+/// Fold a content-op log into a [`ContentMap`] in strict ascending-`ts` order. The log is normally
+/// already sorted (writes append a monotonically increasing tick; remote merges insert in order), but
+/// we sort a clone defensively so the fold is a pure function of the op *set* — the same set always
+/// yields the same map regardless of how it was assembled. This is what makes replicas converge.
+fn fold_content(log: &[StampedContentOp]) -> ContentMap {
+    let mut ordered: Vec<&StampedContentOp> = log.iter().collect();
+    ordered.sort_by(|a, b| a.ts.cmp(&b.ts));
+    let mut content = ContentMap::new();
+    for stamped in ordered {
+        content.apply(stamped.op.clone());
+    }
+    content
+}
+
 /// The persisted state of a single-writer drive: the ordered move log and the content ops. Replaying
 /// both reconstructs the [`DriveTree`] and [`ContentMap`] deterministically.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -43,8 +58,11 @@ pub struct DriveState {
     pub lamport: u64,
     /// The ordered move-op log (collection A).
     pub move_log: Vec<MoveOp>,
-    /// The ordered content-op log (collection B).
-    pub content_log: Vec<ContentOp>,
+    /// The content-op log (collection B), each op tagged with its total-order [`Timestamp`]. Folding
+    /// it in ascending-`ts` order makes the content map LWW-by-timestamp and therefore *order
+    /// independent*: two replicas that receive the same content ops in different arrival orders
+    /// converge to identical state.
+    pub content_log: Vec<StampedContentOp>,
 }
 
 /// A live single-writer drive: the replayed tree + content map plus the persisted [`DriveState`].
@@ -73,10 +91,7 @@ impl Drive {
         for op in &state.move_log {
             tree.apply(op.clone());
         }
-        let mut content = ContentMap::new();
-        for op in &state.content_log {
-            content.apply(op.clone());
-        }
+        let content = fold_content(&state.content_log);
         Drive { state, tree, content }
     }
 
@@ -113,10 +128,14 @@ impl Drive {
         self.state.move_log.push(op);
     }
 
-    /// Apply + persist a content op (writer side).
+    /// Apply + persist a content op (writer side). The op is stamped with a fresh total-order
+    /// [`Timestamp`] (advancing the Lamport clock) so the content log stays a strictly increasing,
+    /// order-independent sequence — local writes are LWW-comparable with remote ops by the same key.
     fn push_content(&mut self, op: ContentOp) {
-        self.content.apply(op.clone());
-        self.state.content_log.push(op);
+        let ts = self.tick();
+        let stamped = StampedContentOp { ts, op };
+        self.content.apply(stamped.op.clone());
+        self.state.content_log.push(stamped);
     }
 
     /// Apply a remote move op (reader side / multi-writer merge): integrate it and record it. The
@@ -127,10 +146,24 @@ impl Drive {
         self.state.move_log.push(op);
     }
 
-    /// Apply a remote content op.
-    pub fn apply_remote_content(&mut self, op: ContentOp) {
-        self.content.apply(op.clone());
-        self.state.content_log.push(op);
+    /// Apply a remote content op (reader side / multi-writer merge). The op carries its own total-order
+    /// [`Timestamp`]; it is inserted into the content log in ascending-`ts` order and the content map
+    /// is re-folded from the ts-ordered log. Because [`ContentMap`] is LWW-by-`(mtime, cid)` and the
+    /// fold visits ops in a single canonical order on *every* replica, two replicas that receive the
+    /// same content ops in different arrival orders converge to identical state. The Lamport clock
+    /// advances past the op so this device's next write strictly post-dates it. Duplicate ops (same
+    /// `ts`) are ignored — the log stays a deduped, ts-ordered set.
+    pub fn apply_remote_content(&mut self, op: StampedContentOp) {
+        self.state.lamport = self.state.lamport.max(op.ts.lamport) + 1;
+        // Locate the insertion point by total order; ignore exact duplicates (idempotent merge).
+        let pos = self.state.content_log.partition_point(|existing| existing.ts < op.ts);
+        if self.state.content_log.get(pos).map(|e| e.ts == op.ts).unwrap_or(false) {
+            return;
+        }
+        self.state.content_log.insert(pos, op);
+        // Re-fold the whole content map from the ts-ordered log so the result is a pure function of
+        // the op *set*, independent of arrival order.
+        self.content = fold_content(&self.state.content_log);
     }
 
     // ---- structural operations (one MoveOp each) ----
@@ -371,6 +404,64 @@ mod tests {
         d.restore_version("/a.md", "cid1").unwrap();
         let id = d.tree.resolve("/a.md").unwrap();
         assert_eq!(d.content.get(&id).unwrap().cid, "cid1");
+    }
+
+    #[test]
+    fn two_replicas_converge_on_content_ops_in_different_orders() {
+        // Theme E regression: two replicas that apply the SAME set of content ops in DIFFERENT
+        // arrival orders must converge to byte-identical content state. Before the fix,
+        // `apply_remote_content` applied ops in arrival order with no timestamp, so the "current"
+        // pointer (and mode) was last-applied — order dependent — and replicas DIVERGED.
+
+        // Build a set of stamped content ops for one file id "f", produced by two writers with
+        // interleaved Lamport ticks (a classic concurrent-edit history), plus a second file "g".
+        fn cop(l: u64, r: &str, id: &str, cid: &str, mode: u32, mtime: u64) -> StampedContentOp {
+            StampedContentOp {
+                ts: Timestamp::new(l, r),
+                op: ContentOp::Set { id: id.into(), cid: cid.into(), size: 1, mode, mtime_ms: mtime },
+            }
+        }
+        let ops = vec![
+            cop(1, "a", "f", "cid-a1", 0o644, 100),
+            cop(2, "b", "f", "cid-b1", 0o600, 250), // newest mtime => should win LWW for "f"
+            cop(3, "a", "f", "cid-a2", 0o640, 150), // older mtime than b1 => loses, but retained
+            cop(2, "a", "g", "cid-g1", 0o644, 90),
+            cop(4, "b", "g", "cid-g2", 0o755, 90),  // same mtime, cid tiebreak (cid-g2 > cid-g1)
+        ];
+
+        // Replica 1 receives them in forward order; replica 2 in reverse order. Neither is the
+        // local writer for these ops — both arrive via apply_remote_content.
+        let mut r1 = Drive::init("w", "r1");
+        for op in ops.iter() {
+            r1.apply_remote_content(op.clone());
+        }
+        let mut r2 = Drive::init("w", "r2");
+        for op in ops.iter().rev() {
+            r2.apply_remote_content(op.clone());
+        }
+        // A third permutation: shuffled-ish interleave.
+        let mut r3 = Drive::init("w", "r3");
+        for i in [3usize, 0, 4, 2, 1] {
+            r3.apply_remote_content(ops[i].clone());
+        }
+
+        // All three converge: same current cid, size, mode, mtime, and full version history per file.
+        for id in ["f", "g"] {
+            let c1 = r1.content.get(id).unwrap();
+            let c2 = r2.content.get(id).unwrap();
+            let c3 = r3.content.get(id).unwrap();
+            assert_eq!(c1, c2, "replicas 1 and 2 diverged on '{id}'");
+            assert_eq!(c1, c3, "replicas 1 and 3 diverged on '{id}'");
+        }
+        // And LWW resolved as expected (newest mtime wins for f; cid tiebreak for g).
+        assert_eq!(r1.content.get("f").unwrap().cid, "cid-b1");
+        assert_eq!(r1.content.get("g").unwrap().cid, "cid-g2");
+        // Idempotent: re-applying the same ops changes nothing (deduped by ts).
+        let before = r1.content.get("f").unwrap().clone();
+        for op in ops.iter() {
+            r1.apply_remote_content(op.clone());
+        }
+        assert_eq!(r1.content.get("f").unwrap(), &before, "duplicate merge must be idempotent");
     }
 
     #[test]
