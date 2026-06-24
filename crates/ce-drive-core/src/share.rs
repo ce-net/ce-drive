@@ -212,13 +212,27 @@ impl Workspace {
 /// caveat confines writes/reads to a subtree; an action that cannot honor it must reject. Mirrors
 /// rdev's `fs_action` path safety.
 pub fn enforce_path_scope(path: &str, chain: &[SignedCapability]) -> Result<(), String> {
-    if path.split('/').any(|c| c == "..") {
-        return Err("path escapes the scope with '..'".into());
+    // Reject traversal and any platform path separator that could smuggle a component boundary the
+    // `/`-split below would miss. CE Drive paths are `/`-separated; a backslash is never a legitimate
+    // separator in a scope check, and a NUL/control char is always an injection attempt.
+    if path.contains('\\') {
+        return Err("path contains a backslash separator".into());
+    }
+    if path.chars().any(|c| (c as u32) < 0x20) {
+        return Err("path contains a control character".into());
+    }
+    for comp in path.split('/') {
+        if comp == ".." || comp == "." {
+            return Err("path escapes the scope with a '.'/'..' component".into());
+        }
     }
     if let Some(prefix) = chain.last().and_then(|c| c.cap.caveats.path_prefix.as_ref()) {
         let norm = normalize_scope(path);
         let pfx = normalize_scope(prefix);
-        // `/` matches everything; otherwise the path must be the prefix or live under it.
+        // `/` matches everything; otherwise the path must be the prefix or live *under* it. The
+        // `{pfx}/` boundary check prevents a sibling-prefix bypass ("/docs" must not match
+        // "/docs-secret"). CE Drive treats names case-sensitively (the underlying CRDT keys exact
+        // bytes), so the scope check is byte-exact by design — see the module docs.
         let ok = pfx == "/" || norm == pfx || norm.starts_with(&format!("{pfx}/"));
         if !ok {
             return Err(format!("path '{norm}' is outside the granted scope '{pfx}'"));
@@ -417,5 +431,28 @@ mod tests {
 
     fn owner_node_id(ws: &Workspace) -> NodeId {
         ws.identity.node_id()
+    }
+
+    #[test]
+    fn sibling_prefix_does_not_bypass_scope() {
+        // A grant on "/docs" must NOT authorize "/docs-secret/..." (a sibling sharing the prefix).
+        let owner = id("owner");
+        let alice = id("alice");
+        let ws = Workspace::new(owner);
+        let g = ws.grant(&alice.node_id_hex(), Ability::Read, "/docs", 0, 1).unwrap();
+        let chain = decode_grant(&g.token).unwrap();
+        let r = ws.authorize_path(&alice.node_id_hex(), "drive:read", "/docs-secret/x", &chain, 1000, &no_revoked());
+        assert!(r.unwrap_err().contains("outside the granted scope"), "sibling-prefix must not bypass");
+        // The legitimate child is allowed.
+        assert!(ws.authorize_path(&alice.node_id_hex(), "drive:read", "/docs/x", &chain, 1000, &no_revoked()).is_ok());
+    }
+
+    #[test]
+    fn backslash_and_control_chars_are_rejected() {
+        let chain: Vec<SignedCapability> = Vec::new();
+        assert!(enforce_path_scope("/docs\\..\\secret", &chain).is_err(), "backslash rejected");
+        assert!(enforce_path_scope("/docs/\u{0000}x", &chain).is_err(), "NUL rejected");
+        assert!(enforce_path_scope("/docs/./x", &chain).is_err(), "single-dot component rejected");
+        assert!(enforce_path_scope("/docs/x", &chain).is_ok(), "clean path accepted");
     }
 }

@@ -66,7 +66,11 @@ impl BlockStore for CoreStore {
     }
 }
 
+// This is a shared test-support module (it exports `MockStore` for sibling integration tests via the
+// `pub use` below), not a `#[cfg(test)] mod tests` of in-file unit tests — so the re-export that must
+// follow it is intentional.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod test_support {
     use super::*;
     use std::collections::HashMap;

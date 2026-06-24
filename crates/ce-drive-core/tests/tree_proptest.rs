@@ -202,7 +202,7 @@ proptest! {
 /// the in-`lib.rs` unit test with a deeper 3-level subtree so descendant path-rederivation is tested.
 #[test]
 fn deep_concurrent_swap_converges() {
-    let base = vec![
+    let base = [
         MoveOp { ts: Timestamp::new(1, "a"), child: "A".into(), new_parent: ROOT.into(), new_name: "A".into(), kind: NodeKind::Dir },
         MoveOp { ts: Timestamp::new(2, "a"), child: "B".into(), new_parent: ROOT.into(), new_name: "B".into(), kind: NodeKind::Dir },
         MoveOp { ts: Timestamp::new(3, "a"), child: "A1".into(), new_parent: "A".into(), new_name: "A1".into(), kind: NodeKind::Dir },

@@ -18,7 +18,7 @@ fn node_url() -> String {
 async fn store_roundtrip_and_dedup_against_live_node() {
     let client = CeClient::new(node_url());
     // Skip if there is no reachable node (CI sandbox / no node running).
-    if client.health().await.unwrap_or(false) == false {
+    if !client.health().await.unwrap_or(false) {
         eprintln!("SKIP: no CE node at {} (set CE_NODE_URL to run)", node_url());
         return;
     }

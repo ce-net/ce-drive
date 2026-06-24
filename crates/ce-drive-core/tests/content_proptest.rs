@@ -116,7 +116,7 @@ proptest! {
     ) {
         let mut versions = Vec::new();
         for i in 0..nver {
-            versions.push(Version { set_at_ms: (i as u64).wrapping_mul(7), cid: format!("v{i}"), size: i as u64 });
+            versions.push(Version { set_at_ms: (i as u64).wrapping_mul(7), cid: format!("v{i}"), size: i as u64, conflict: i % 3 == 0 });
         }
         let fc = FileContent { cid, size, mode, mtime_ms: mtime, versions, doc_id: None };
 

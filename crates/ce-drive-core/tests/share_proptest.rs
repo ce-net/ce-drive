@@ -121,11 +121,11 @@ proptest! {
         // admin action implies the parent was admin; a successful write implies the parent had write.
         let admin = ws.authorize_path(&bob.node_id_hex(), "drive:admin", "/docs/x", &chain, 1000, &no_revoked());
         prop_assert!(
-            !admin.is_ok() || rank(parent_ability) >= rank(Ability::Admin),
+            admin.is_err() || rank(parent_ability) >= rank(Ability::Admin),
             "delegation amplified to admin beyond a non-admin parent={:?}", parent_ability
         );
         prop_assert!(
-            !r.is_ok() || rank(parent_ability) >= rank(Ability::Write),
+            r.is_err() || rank(parent_ability) >= rank(Ability::Write),
             "delegation amplified to write beyond a non-write parent={:?}", parent_ability
         );
     }

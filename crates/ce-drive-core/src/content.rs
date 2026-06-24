@@ -32,6 +32,12 @@ pub struct Version {
     pub cid: String,
     /// Size in bytes.
     pub size: u64,
+    /// True if this version was a **genuine concurrent edit that lost LWW** (a different cid arriving
+    /// with an mtime not newer than the then-current pointer) — as opposed to ordinary sequential
+    /// history (a superseded older save). Surfaced as a Dropbox-style `*.conflict` copy by
+    /// [`FileContent::conflict_versions`]. `#[serde(default)]` keeps older wire vectors loadable.
+    #[serde(default)]
+    pub conflict: bool,
 }
 
 /// The content of one file node: the current pointer plus the version history. Keyed by NodeId in
@@ -71,23 +77,50 @@ impl FileContent {
         }
         let newer = mtime_ms > self.mtime_ms || (mtime_ms == self.mtime_ms && cid > self.cid);
         if !newer {
-            // The incoming edit is older/loses LWW. Still record it in history so nothing is lost.
-            self.push_version(Version { set_at_ms: mtime_ms, cid, size });
+            // The incoming edit loses LWW. If its mtime is *not older* than the current pointer (equal
+            // mtime, lost only on the cid tiebreak), it is a genuine concurrent edit — flag it as a
+            // conflict so it can be surfaced as a `*.conflict` copy. A strictly-older edit is ordinary
+            // superseded history. Either way nothing is lost: it is retained in the version list.
+            let is_concurrent = mtime_ms >= self.mtime_ms;
+            self.push_version(Version { set_at_ms: mtime_ms, cid, size, conflict: is_concurrent });
             return false;
         }
-        // Push the current pointer to history, then advance to the new content.
-        self.push_version(Version { set_at_ms: self.mtime_ms, cid: self.cid.clone(), size: self.size });
+        // The incoming edit wins LWW. If the *displaced* current pointer had an equal-or-newer mtime
+        // relative to... it always predates the winner by definition here, so it is ordinary history.
+        // However, if the winner and loser have the SAME mtime (cid-tiebreak win), the displaced
+        // pointer is itself a concurrent conflict copy — flag it.
+        let displaced_conflict = mtime_ms == self.mtime_ms;
+        self.push_version(Version {
+            set_at_ms: self.mtime_ms,
+            cid: self.cid.clone(),
+            size: self.size,
+            conflict: displaced_conflict,
+        });
         self.cid = cid;
         self.size = size;
         self.mtime_ms = mtime_ms;
         true
     }
 
+    /// The version entries that were genuine concurrent-edit conflicts (lost LWW with an equal-or-
+    /// newer mtime), newest-first. The UX renders each as a sibling `*.conflict-<short-cid>` copy so a
+    /// concurrent edit is visible (Dropbox-style) rather than buried silently in version history.
+    pub fn conflict_versions(&self) -> Vec<&Version> {
+        let mut v: Vec<&Version> = self.versions.iter().filter(|x| x.conflict).collect();
+        v.sort_by(|a, b| b.set_at_ms.cmp(&a.set_at_ms).then_with(|| b.cid.cmp(&a.cid)));
+        v
+    }
+
+    /// True if this file currently has any unresolved concurrent-edit conflict copy.
+    pub fn has_conflict(&self) -> bool {
+        self.versions.iter().any(|v| v.conflict)
+    }
+
     /// Point `current` back at a prior version (undo / restore). Returns `false` if no such version.
     pub fn restore(&mut self, cid: &str, now_ms: u64) -> bool {
         if let Some(v) = self.versions.iter().find(|v| v.cid == cid).cloned() {
             // Archive the (current) pointer, then make the restored one current with a fresh mtime.
-            self.push_version(Version { set_at_ms: self.mtime_ms, cid: self.cid.clone(), size: self.size });
+            self.push_version(Version { set_at_ms: self.mtime_ms, cid: self.cid.clone(), size: self.size, conflict: false });
             self.cid = v.cid;
             self.size = v.size;
             self.mtime_ms = now_ms;
@@ -149,6 +182,17 @@ impl ContentMap {
     /// The content record for a node, if present.
     pub fn get(&self, id: &str) -> Option<&FileContent> {
         self.map.get(id)
+    }
+
+    /// Remove a node's content record entirely. Used by the incremental per-key refold and by GC.
+    /// Returns the removed record, if any.
+    pub fn remove(&mut self, id: &str) -> Option<FileContent> {
+        self.map.remove(id)
+    }
+
+    /// Insert/replace a node's content record directly (snapshot bootstrap path).
+    pub fn insert(&mut self, id: impl Into<NodeId>, content: FileContent) {
+        self.map.insert(id.into(), content);
     }
 
     /// Number of content records.
@@ -254,6 +298,31 @@ mod tests {
             c.record(format!("cid{i}"), i, i);
         }
         assert!(c.versions.len() <= MAX_VERSIONS);
+    }
+
+    #[test]
+    fn concurrent_same_mtime_edit_is_flagged_conflict() {
+        let mut c = FileContent::new("cid-mmm", 1, 0o644, 500);
+        // A concurrent edit with the SAME mtime but a smaller cid loses on the tiebreak.
+        assert!(!c.record("cid-aaa", 1, 500), "smaller cid loses LWW at equal mtime");
+        assert!(c.has_conflict(), "equal-mtime loser is a concurrent conflict");
+        assert_eq!(c.conflict_versions().len(), 1);
+        assert_eq!(c.conflict_versions()[0].cid, "cid-aaa");
+        // A strictly-older edit is ordinary history, not a conflict.
+        let mut c2 = FileContent::new("cid-new", 1, 0o644, 500);
+        c2.record("cid-old", 1, 100);
+        assert!(!c2.has_conflict(), "strictly-older edit is not a conflict");
+    }
+
+    #[test]
+    fn winning_tiebreak_flags_displaced_as_conflict() {
+        // current cid-aaa @500; a larger cid-zzz @500 wins the tiebreak; displaced cid-aaa is a
+        // concurrent conflict copy.
+        let mut c = FileContent::new("cid-aaa", 1, 0o644, 500);
+        assert!(c.record("cid-zzz", 1, 500), "larger cid wins at equal mtime");
+        assert_eq!(c.cid, "cid-zzz");
+        assert!(c.has_conflict());
+        assert_eq!(c.conflict_versions()[0].cid, "cid-aaa");
     }
 
     #[test]

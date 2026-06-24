@@ -500,7 +500,7 @@ mod tests {
                 op: ContentOp::Set { id: id.into(), cid: cid.into(), size: 1, mode: 0, mtime_ms: mtime },
             }
         }
-        let ops = vec![
+        let ops = [
             cop(1, "a", "f1", "cidA", 100),
             cop(2, "b", "f1", "cidB", 200), // later mtime wins
             cop(3, "a", "f2", "cidC", 50),

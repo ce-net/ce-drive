@@ -48,6 +48,13 @@ pub const ROOT: &str = "ROOT";
 /// The reserved trash node id. Deleting a node moves it under `TRASH` (content kept until GC).
 pub const TRASH: &str = "TRASH";
 
+/// The reserved limbo node id. Hard-deleting a node (after `empty-trash`/GC) moves it under `LIMBO`,
+/// a parent that is never listed, resolved, or path-derived — so the node leaves every live and trash
+/// listing while its tombstone move op remains in the log (so peers converge on the removal). Keeping
+/// it as an explicit detach (rather than dropping the edge) preserves the move-CRDT invariant that
+/// every node's current location is defined by the latest move targeting it.
+pub const LIMBO: &str = "LIMBO";
+
 /// A total-order key for moves: a Lamport clock tie-broken by the replica id. Ordering is
 /// `(lamport, replica)` lexicographically, which is a strict total order across all replicas.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -225,10 +232,10 @@ impl DriveTree {
         self.edges.get(node)
     }
 
-    /// True if the node is live (exists and is not under TRASH).
+    /// True if the node is live (exists and is not under TRASH or LIMBO).
     pub fn is_live(&self, node: &str) -> bool {
         match self.edges.get(node) {
-            Some(_) => !self.is_ancestor(TRASH, node),
+            Some(_) => !self.is_ancestor(TRASH, node) && !self.is_ancestor(LIMBO, node),
             None => node == ROOT, // ROOT is implicitly live; everything else needs an edge
         }
     }
@@ -236,6 +243,12 @@ impl DriveTree {
     /// True if the node is in the trash subtree.
     pub fn is_trashed(&self, node: &str) -> bool {
         self.is_ancestor(TRASH, node)
+    }
+
+    /// True if the node has been hard-deleted (detached under [`LIMBO`]); it derives no path and is
+    /// never listed or resolved.
+    pub fn is_limbo(&self, node: &str) -> bool {
+        self.is_ancestor(LIMBO, node)
     }
 
     /// The children of `parent`, as `(name, child)` pairs sorted by name. After applying the

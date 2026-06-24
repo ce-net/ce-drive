@@ -90,10 +90,10 @@ impl DriveTree {
             return self.edges.get(&op.child).cloned();
         }
         let old = self.edges.get(&op.child).cloned();
-        if let Some(prev) = &old {
-            if let Some(set) = self.children.get_mut(&prev.parent) {
-                set.remove(&(prev.name.clone(), op.child.clone()));
-            }
+        if let Some(prev) = &old
+            && let Some(set) = self.children.get_mut(&prev.parent)
+        {
+            set.remove(&(prev.name.clone(), op.child.clone()));
         }
         let edge = Edge {
             parent: op.new_parent.clone(),
@@ -110,10 +110,10 @@ impl DriveTree {
 
     fn undo_move(&mut self, entry: &LogEntry) {
         let child = &entry.op.child;
-        if let Some(cur) = self.edges.get(child).cloned() {
-            if let Some(set) = self.children.get_mut(&cur.parent) {
-                set.remove(&(cur.name.clone(), child.clone()));
-            }
+        if let Some(cur) = self.edges.get(child).cloned()
+            && let Some(set) = self.children.get_mut(&cur.parent)
+        {
+            set.remove(&(cur.name.clone(), child.clone()));
         }
         match &entry.old {
             Some(prev) => {

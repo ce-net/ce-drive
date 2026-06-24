@@ -24,9 +24,12 @@
 //! base units — integers, decimal strings on the wire, never floats.
 
 pub mod audit;
+pub mod changes;
 pub mod content;
 pub mod drive;
 pub mod durability;
+pub mod names;
+pub mod search;
 pub mod share;
 pub mod store;
 pub mod sync;
@@ -34,11 +37,15 @@ pub mod tree;
 
 // Re-export the most-used types at the crate root for ergonomic downstream use.
 pub use content::{ContentMap, ContentOp, FileContent};
-pub use drive::{Drive, DriveState, DirEntry};
+pub use drive::{ContentConflict, Drive, DriveState, DirEntry};
 pub use durability::{Durability, PinPolicy, PinStatus};
 pub use share::{Ability, Grant, Workspace};
 pub use store::{Store, StoredFile};
 pub use sync::{ContentMerge, StampedContentOp, SyncedDrive, TreeMerge};
-pub use tree::{DriveTree, MoveOp, NodeId, NodeKind, ROOT, TRASH, Timestamp};
+pub use tree::{DriveTree, LIMBO, MoveOp, NodeId, NodeKind, ROOT, TRASH, Timestamp};
 
 pub use audit::{Audit, AuditEntry, AuditJournal, GrantRecord, RevokeRecord};
+
+pub use changes::{Change, ChangeKind, ChangeLog, Cursor};
+pub use names::{NameError, MAX_NAME_BYTES, check_name, validate_name};
+pub use search::{SearchHit, SearchIndex};

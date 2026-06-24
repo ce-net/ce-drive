@@ -107,10 +107,10 @@ fn spawn_node(
 async fn await_ready(node: &mut Node) -> bool {
     let token_path = node.data_dir.join("api.token");
     for _ in 0..120 {
-        if node.token.is_empty() {
-            if let Ok(t) = std::fs::read_to_string(&token_path) {
-                node.token = t.trim().to_string();
-            }
+        if node.token.is_empty()
+            && let Ok(t) = std::fs::read_to_string(&token_path)
+        {
+            node.token = t.trim().to_string();
         }
         if !node.token.is_empty() {
             let client = CeClient::with_token(node.api_url.clone(), Some(node.token.clone()));
@@ -219,8 +219,8 @@ async fn two_writers_converge_on_concurrent_mutations() {
     let b_id = coord_b.node_id().to_string();
     assert_ne!(a_id, b_id, "two distinct nodes");
 
-    let drive_a = SyncedDrive::open(&coord_a, "team", &[b_id.clone()]).await.expect("open A");
-    let drive_b = SyncedDrive::open(&coord_b, "team", &[a_id.clone()]).await.expect("open B");
+    let drive_a = SyncedDrive::open(&coord_a, "team", std::slice::from_ref(&b_id)).await.expect("open A");
+    let drive_b = SyncedDrive::open(&coord_b, "team", std::slice::from_ref(&a_id)).await.expect("open B");
 
     // --- A seeds a shared parent dir; wait for B to see it (so both mutate under the SAME tree) ---
     drive_a.mkdir("/", "shared").await.expect("A mkdir shared");

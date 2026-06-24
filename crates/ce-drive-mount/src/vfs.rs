@@ -107,7 +107,14 @@ pub struct Vfs<S: BlockStore> {
     store: S,
     attr_ttl: Duration,
     entry_ttl: Duration,
+    /// Reject writes that would grow a file beyond this many bytes (a per-file DoS / RAM guard, since
+    /// the write-back buffer is in memory). `0` = unbounded.
+    max_file_size: u64,
 }
+
+/// Default per-file write cap for the in-memory write-back buffer: 2 GiB. Beyond this the mount errors
+/// (`EFBIG`) rather than letting one file's dirty buffer exhaust RAM. Tunable via [`Vfs::with_max_file_size`].
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 struct VfsInner {
     /// The drive model (tree + content map). Re-read on `revalidate` for close-to-open consistency.
@@ -144,6 +151,7 @@ impl<S: BlockStore> Vfs<S> {
             store,
             attr_ttl: DEFAULT_ATTR_TTL,
             entry_ttl: DEFAULT_ENTRY_TTL,
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
         }
     }
 
@@ -152,6 +160,18 @@ impl<S: BlockStore> Vfs<S> {
         self.attr_ttl = attr_ttl;
         self.entry_ttl = entry_ttl;
         self
+    }
+
+    /// Override the per-file write cap (bytes; `0` = unbounded). Writes past this fail with an error
+    /// the adapter maps to `EFBIG`, bounding the in-memory write-back buffer.
+    pub fn with_max_file_size(mut self, max: u64) -> Self {
+        self.max_file_size = max;
+        self
+    }
+
+    /// The configured per-file write cap (bytes; `0` = unbounded).
+    pub fn max_file_size(&self) -> u64 {
+        self.max_file_size
     }
 
     /// The attribute TTL the adapter should hand the kernel.
@@ -358,6 +378,10 @@ impl<S: BlockStore> Vfs<S> {
     /// here). The buffer is hydrated first so a partial overwrite preserves the untouched tail. Marks
     /// the handle dirty. Returns the number of bytes written.
     pub async fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
+        let end = offset + data.len() as u64;
+        if self.max_file_size != 0 && end > self.max_file_size {
+            bail!("write to {end} bytes exceeds the {}-byte per-file limit", self.max_file_size);
+        }
         self.hydrate(fh).await?;
         let mut g = self.inner.lock().await;
         let of = g.open.get_mut(&fh).ok_or_else(|| anyhow!("bad file handle {fh}"))?;
@@ -373,6 +397,9 @@ impl<S: BlockStore> Vfs<S> {
 
     /// Truncate (or extend) a file's working buffer to `size` (the `setattr`/`ftruncate` path).
     pub async fn truncate(&self, fh: u64, size: u64) -> Result<()> {
+        if self.max_file_size != 0 && size > self.max_file_size {
+            bail!("truncate to {size} bytes exceeds the {}-byte per-file limit", self.max_file_size);
+        }
         self.hydrate(fh).await?;
         let mut g = self.inner.lock().await;
         let of = g.open.get_mut(&fh).ok_or_else(|| anyhow!("bad file handle {fh}"))?;
@@ -470,12 +497,31 @@ impl<S: BlockStore> Vfs<S> {
         let src_dir = g.drive.tree().path(&parent_node).ok_or_else(|| anyhow!("src parent not addressable"))?;
         let dst_dir = g.drive.tree().path(&new_parent_node).ok_or_else(|| anyhow!("dst parent not addressable"))?;
         let src = join_path(&src_dir, name);
-        // If the destination name already exists, remove it first (POSIX rename overwrite semantics).
+        // Resolve the source up front: if it is missing, fail BEFORE touching the destination, so a
+        // bad rename never destroys an existing destination (the audit's atomicity fix).
+        let src_node = g
+            .drive
+            .tree()
+            .resolve(&src)
+            .ok_or_else(|| anyhow!("rename source '{src}' does not exist"))?;
         let dst_existing = join_path(&dst_dir, new_name);
-        if g.drive.tree().resolve(&dst_existing).is_some() {
-            let _ = g.drive.rm(&dst_existing);
-        }
+        let displaced = g.drive.tree().resolve(&dst_existing).filter(|n| n != &src_node);
+        // Move the source onto the destination name FIRST. If a node already lives there, this
+        // produces a transient name collision the tree renders deterministically (conflict copy) —
+        // the destination is never lost. Only after the move succeeds do we trash the old occupant,
+        // giving POSIX overwrite semantics without a window where the destination is gone but the
+        // source has not yet arrived.
         g.drive.mv(&src, &dst_dir, new_name)?;
+        if let Some(old) = displaced {
+            // Trash the displaced node by id (its path is now conflict-rendered, so resolve-by-path is
+            // ambiguous; trash by walking from the parent and matching the node id).
+            let trash_path = g
+                .drive
+                .tree()
+                .path(&old)
+                .unwrap_or_else(|| join_path(&dst_dir, new_name));
+            let _ = g.drive.rm(&trash_path);
+        }
         g.dirty_model = true;
         Ok(())
     }

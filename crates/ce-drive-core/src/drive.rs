@@ -15,9 +15,11 @@ use anyhow::{Result, bail};
 use ce_coord::StateMachine;
 use serde::{Deserialize, Serialize};
 
+use crate::changes::{Change, ChangeLog, Cursor};
 use crate::content::{ContentMap, ContentOp, FileContent};
+use crate::names::check_name;
 use crate::sync::StampedContentOp;
-use crate::tree::{DriveTree, MoveOp, NodeKind, ROOT, TRASH, Timestamp};
+use crate::tree::{DriveTree, LIMBO, MoveOp, NodeKind, ROOT, TRASH, Timestamp};
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -44,6 +46,32 @@ fn fold_content(log: &[StampedContentOp]) -> ContentMap {
         content.apply(stamped.op.clone());
     }
     content
+}
+
+/// The node id an op targets (every [`ContentOp`] variant keys by a single node).
+fn op_target(op: &ContentOp) -> &str {
+    match op {
+        ContentOp::Set { id, .. }
+        | ContentOp::Restore { id, .. }
+        | ContentOp::Remove { id }
+        | ContentOp::SetDoc { id, .. } => id,
+    }
+}
+
+/// Re-fold the content record for a **single** node id from the ts-ordered subset of the log that
+/// targets it, and splice the result into `content`. This is the incremental counterpart of
+/// [`fold_content`]: applying a remote op only re-derives the one affected key (O(ops-for-that-key))
+/// instead of re-folding the entire map (O(total-ops)) on every merge. Convergence is preserved
+/// because the per-key result is a pure function of that key's op subset in canonical ts order — and
+/// no [`ContentOp`] variant ever reads or writes a *different* key, so keys are independent.
+fn refold_key(content: &mut ContentMap, log: &[StampedContentOp], id: &str) {
+    let mut subset: Vec<&StampedContentOp> =
+        log.iter().filter(|s| op_target(&s.op) == id).collect();
+    subset.sort_by(|a, b| a.ts.cmp(&b.ts));
+    content.remove(id);
+    for s in subset {
+        content.apply(s.op.clone());
+    }
 }
 
 /// The persisted state of a single-writer drive: the ordered move log and the content ops. Replaying
@@ -160,16 +188,19 @@ impl Drive {
         if self.state.content_log.get(pos).map(|e| e.ts == op.ts).unwrap_or(false) {
             return;
         }
+        let id = op_target(&op.op).to_string();
         self.state.content_log.insert(pos, op);
-        // Re-fold the whole content map from the ts-ordered log so the result is a pure function of
-        // the op *set*, independent of arrival order.
-        self.content = fold_content(&self.state.content_log);
+        // Re-fold only the affected key from its ts-ordered op subset (the other keys are unchanged,
+        // since no ContentOp variant ever touches a different node id). Convergent and O(ops-for-key)
+        // rather than O(total-ops): a long-lived drive merging remote ops stays linear, not quadratic.
+        refold_key(&mut self.content, &self.state.content_log, &id);
     }
 
     // ---- structural operations (one MoveOp each) ----
 
     /// Create a directory under `parent_path`, returning its node id.
     pub fn mkdir(&mut self, parent_path: &str, name: &str) -> Result<String> {
+        check_name(name)?;
         let parent = self.resolve_dir(parent_path)?;
         if self.child_named(&parent, name).is_some() {
             bail!("'{name}' already exists in '{parent_path}'");
@@ -183,6 +214,7 @@ impl Drive {
     /// Add a file node under `parent_path` with the given content (already stored). Returns the new
     /// node id. The [`FileContent`] is recorded in the content map keyed by that id.
     pub fn add_file(&mut self, parent_path: &str, name: &str, content: FileContent) -> Result<String> {
+        check_name(name)?;
         let parent = self.resolve_dir(parent_path)?;
         // If a file with this name already exists, treat it as a new version of that file (edit),
         // keyed by the SAME node id — so renames and edits never collide.
@@ -214,6 +246,7 @@ impl Drive {
 
     /// Move/rename a node from `src_path` to `dst_parent_path`/`dst_name`. One `MoveOp`.
     pub fn mv(&mut self, src_path: &str, dst_parent_path: &str, dst_name: &str) -> Result<()> {
+        check_name(dst_name)?;
         let node = self.tree.resolve(src_path).ok_or_else(|| anyhow::anyhow!("no such path: {src_path}"))?;
         if node == ROOT {
             bail!("cannot move the root");
@@ -238,6 +271,113 @@ impl Drive {
         Ok(())
     }
 
+    /// List the trash: every node that currently lives directly under [`TRASH`], as [`DirEntry`]s
+    /// (with their original bare names). These are the user-visible "deleted but recoverable" items.
+    pub fn trash(&self) -> Vec<DirEntry> {
+        self.tree
+            .readdir(TRASH)
+            .into_iter()
+            .map(|(name, id, kind)| DirEntry {
+                name,
+                is_dir: matches!(kind, NodeKind::Dir),
+                content: self.content.get(&id).cloned(),
+                node_id: id,
+            })
+            .collect()
+    }
+
+    /// Restore a trashed node back to a live directory. `dst_parent_path` defaults to `/` when `None`;
+    /// `dst_name` defaults to the node's current (trashed) name when `None`. Errors if the node is not
+    /// in the trash, or the destination is not a directory, or the name collides with a live child.
+    pub fn restore(
+        &mut self,
+        node_id: &str,
+        dst_parent_path: Option<&str>,
+        dst_name: Option<&str>,
+    ) -> Result<()> {
+        if !self.tree.is_trashed(node_id) {
+            bail!("node '{node_id}' is not in the trash");
+        }
+        let cur_name = self.tree.edge(node_id).map(|e| e.name.clone()).unwrap_or_default();
+        let name = dst_name.map(|s| s.to_string()).unwrap_or(cur_name);
+        check_name(&name)?;
+        let parent_path = dst_parent_path.unwrap_or("/");
+        let parent = self.resolve_dir(parent_path)?;
+        if self.child_named(&parent, &name).is_some() {
+            bail!("'{name}' already exists in '{parent_path}'");
+        }
+        let kind = self.tree.edge(node_id).map(|e| e.kind.clone()).unwrap_or(NodeKind::File);
+        let ts = self.tick();
+        self.push_move(MoveOp {
+            ts,
+            child: node_id.to_string(),
+            new_parent: parent,
+            new_name: name,
+            kind,
+        });
+        Ok(())
+    }
+
+    /// Permanently remove every trashed node and emit a [`ContentOp::Remove`] for each so the content
+    /// record (and thus its CIDs) becomes a GC candidate. Returns the node ids hard-deleted. The
+    /// node's edge is dropped from the tree by moving it to a private limbo parent (it stops being a
+    /// trash child and is no longer reachable), and its content record is removed. Idempotent.
+    pub fn empty_trash(&mut self) -> Vec<String> {
+        let ids: Vec<String> = self.tree.readdir(TRASH).into_iter().map(|(_, id, _)| id).collect();
+        self.hard_delete(&ids);
+        ids
+    }
+
+    /// Garbage-collect trashed nodes whose deletion is older than `retention_secs` relative to `now`
+    /// (unix seconds). A node's "deletion time" is the wall-clock derived from the timestamp of the
+    /// move that put it in the trash — but Lamport ticks are not wall-clock, so callers that need a
+    /// true wall-clock retention should pass content-record mtimes via [`Drive::gc_trash_by_mtime`].
+    /// This variant GCs every trashed node (retention 0) or, when `retention_secs > 0`, only those
+    /// whose newest content mtime is older than the cutoff. Returns the hard-deleted node ids.
+    pub fn gc_trash(&mut self, now_secs: u64, retention_secs: u64) -> Vec<String> {
+        if retention_secs == 0 {
+            return self.empty_trash();
+        }
+        let cutoff_ms = now_secs.saturating_sub(retention_secs).saturating_mul(1000);
+        let victims: Vec<String> = self
+            .tree
+            .readdir(TRASH)
+            .into_iter()
+            .filter(|(_, id, _)| {
+                // A node with no content (e.g. a dir) GCs immediately; a file GCs once its newest
+                // content mtime predates the cutoff.
+                match self.content.get(id) {
+                    Some(c) => c.mtime_ms <= cutoff_ms,
+                    None => true,
+                }
+            })
+            .map(|(_, id, _)| id)
+            .collect();
+        self.hard_delete(&victims);
+        victims
+    }
+
+    /// Hard-delete the given node ids: detach each from the tree (move to a private, unreachable
+    /// limbo id so it leaves the trash listing and derives no path) and remove its content record.
+    fn hard_delete(&mut self, ids: &[String]) {
+        for id in ids {
+            // Detach: a move to a reserved limbo parent the tree never lists or resolves.
+            let kind = self.tree.edge(id).map(|e| e.kind.clone()).unwrap_or(NodeKind::File);
+            let ts = self.tick();
+            self.push_move(MoveOp {
+                ts,
+                child: id.clone(),
+                new_parent: LIMBO.to_string(),
+                new_name: id.clone(),
+                kind,
+            });
+            // Drop the content record (and emit the op so peers converge on the removal).
+            if self.content.get(id).is_some() {
+                self.push_content(ContentOp::Remove { id: id.clone() });
+            }
+        }
+    }
+
     /// Record new content for an existing file node by its **stable NodeId** (the write-back path the
     /// mount uses on flush). Unlike [`Drive::add_file`], which resolves by path+name, this keys
     /// directly by id — so a file being concurrently renamed never loses the write (collection (B)
@@ -251,6 +391,30 @@ impl Drive {
             mode: content.mode,
             mtime_ms: content.mtime_ms,
         });
+    }
+
+    /// Every live file that currently carries an unresolved concurrent-edit conflict, as
+    /// `(path, current_cid, conflict_cids)`. The UX renders each `conflict_cid` as a sibling
+    /// `<name>.conflict-<short-cid>` copy so a user sees both sides of a concurrent edit (Dropbox
+    /// style) instead of one silently winning LWW. Resolving = picking one (a normal save) — the
+    /// loser stays in version history.
+    pub fn content_conflicts(&self) -> Vec<ContentConflict> {
+        let mut out = Vec::new();
+        for (id, content) in self.content.entries() {
+            if !content.has_conflict() {
+                continue;
+            }
+            // Only surface conflicts for nodes that are live (not trashed/limbo).
+            let Some(path) = self.tree.path(id) else { continue };
+            out.push(ContentConflict {
+                node_id: id.clone(),
+                path,
+                current_cid: content.cid.clone(),
+                conflict_cids: content.conflict_versions().iter().map(|v| v.cid.clone()).collect(),
+            });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
     }
 
     /// Restore a file node to a prior version CID.
@@ -292,6 +456,116 @@ impl Drive {
         self.content.all_cids()
     }
 
+    /// The change feed since `cursor`: up to `limit` changes (0 = unbounded) in ascending timestamp
+    /// order plus the cursor to poll with next. Powers incremental client sync and the activity feed.
+    pub fn changes_since(&self, cursor: &Cursor, limit: usize) -> (Vec<Change>, Cursor) {
+        ChangeLog::new(&self.state, &self.tree).changes_since(cursor, limit)
+    }
+
+    /// The current head cursor — open here to receive only *future* changes (skip history).
+    pub fn changes_head(&self) -> Cursor {
+        ChangeLog::new(&self.state, &self.tree).head()
+    }
+
+    /// Build a fresh filename/metadata [`SearchIndex`](crate::search::SearchIndex) over the live tree.
+    pub fn search_index(&self) -> crate::search::SearchIndex {
+        crate::search::SearchIndex::build(self)
+    }
+
+    /// Compact the persisted state: replace the full move/content op history with a **minimal
+    /// equivalent log** that reconstructs the current live tree + content map. This bounds the state
+    /// file size and replay time for a long-lived single-writer drive (the multi-writer
+    /// [`SyncedDrive`](crate::sync::SyncedDrive) has its own ce-coord checkpoint path).
+    ///
+    /// The compacted log is a deterministic, ts-ordered sequence: for every live node (BFS from ROOT,
+    /// parents before children so each move's parent already exists) one create [`MoveOp`], and for
+    /// every content record one [`ContentOp::Set`] plus its retained version history as ordered
+    /// `Set`/`Restore` ops. Trashed and limbo nodes are dropped (their history is intentionally
+    /// discarded — compaction is the GC boundary). Lamport is reset to the new log length. The
+    /// reconstructed drive lists identically to the original for all live content.
+    pub fn compact(&mut self) {
+        let mut new_moves: Vec<MoveOp> = Vec::new();
+        let mut new_content: Vec<StampedContentOp> = Vec::new();
+        let mut lamport: u64 = 0;
+        let replica = self.state.replica.clone();
+        let next_ts = |lamport: &mut u64| {
+            *lamport += 1;
+            Timestamp::new(*lamport, replica.clone())
+        };
+
+        // BFS the live tree from ROOT so parents are created before children.
+        let mut queue: std::collections::VecDeque<String> =
+            std::collections::VecDeque::from([ROOT.to_string()]);
+        while let Some(parent) = queue.pop_front() {
+            // raw_children gives bare (name, id); skip trashed/limbo.
+            let mut kids = self.tree.raw_children(&parent);
+            kids.sort();
+            for (name, id) in kids {
+                if self.tree.is_trashed(&id) || self.tree.is_limbo(&id) {
+                    continue;
+                }
+                let kind = self.tree.edge(&id).map(|e| e.kind.clone()).unwrap_or(NodeKind::File);
+                new_moves.push(MoveOp {
+                    ts: next_ts(&mut lamport),
+                    child: id.clone(),
+                    new_parent: parent.clone(),
+                    new_name: name,
+                    kind: kind.clone(),
+                });
+                if matches!(kind, NodeKind::Dir) {
+                    queue.push_back(id.clone());
+                }
+                // Content for this node (with version history, oldest version first then current).
+                if let Some(c) = self.content.get(&id) {
+                    for v in &c.versions {
+                        new_content.push(StampedContentOp {
+                            ts: next_ts(&mut lamport),
+                            op: ContentOp::Set {
+                                id: id.clone(),
+                                cid: v.cid.clone(),
+                                size: v.size,
+                                mode: c.mode,
+                                mtime_ms: v.set_at_ms,
+                            },
+                        });
+                    }
+                    new_content.push(StampedContentOp {
+                        ts: next_ts(&mut lamport),
+                        op: ContentOp::Set {
+                            id: id.clone(),
+                            cid: c.cid.clone(),
+                            size: c.size,
+                            mode: c.mode,
+                            mtime_ms: c.mtime_ms,
+                        },
+                    });
+                    if let Some(doc_id) = &c.doc_id {
+                        new_content.push(StampedContentOp {
+                            ts: next_ts(&mut lamport),
+                            op: ContentOp::SetDoc { id: id.clone(), doc_id: doc_id.clone() },
+                        });
+                    }
+                }
+            }
+        }
+
+        self.state.move_log = new_moves;
+        self.state.content_log = new_content;
+        self.state.lamport = lamport;
+        // Rebuild the live views from the compacted log (identical live state, smaller history).
+        let mut tree = DriveTree::new();
+        for op in &self.state.move_log {
+            tree.apply(op.clone());
+        }
+        self.tree = tree;
+        self.content = fold_content(&self.state.content_log);
+    }
+
+    /// The total number of ops (move + content) currently persisted — the compaction trigger metric.
+    pub fn op_count(&self) -> usize {
+        self.state.move_log.len() + self.state.content_log.len()
+    }
+
     /// Resolve a path that must be an existing directory (or ROOT). Errors if it is a file.
     fn resolve_dir(&self, path: &str) -> Result<String> {
         let node = self.tree.resolve(path).ok_or_else(|| anyhow::anyhow!("no such directory: {path}"))?;
@@ -309,6 +583,19 @@ impl Drive {
             .find(|(n, id)| n == name && !self.tree.is_trashed(id))
             .map(|(_, id)| id)
     }
+}
+
+/// A live file with an unresolved concurrent-edit conflict (from [`Drive::content_conflicts`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentConflict {
+    /// The conflicted file's node id.
+    pub node_id: String,
+    /// Its derived path.
+    pub path: String,
+    /// The CID that currently won LWW.
+    pub current_cid: String,
+    /// The CIDs of the concurrent edits that lost (rendered as `*.conflict` copies), newest-first.
+    pub conflict_cids: Vec<String>,
 }
 
 /// One listing entry from [`Drive::ls`].
@@ -421,7 +708,7 @@ mod tests {
                 op: ContentOp::Set { id: id.into(), cid: cid.into(), size: 1, mode, mtime_ms: mtime },
             }
         }
-        let ops = vec![
+        let ops = [
             cop(1, "a", "f", "cid-a1", 0o644, 100),
             cop(2, "b", "f", "cid-b1", 0o600, 250), // newest mtime => should win LWW for "f"
             cop(3, "a", "f", "cid-a2", 0o640, 150), // older mtime than b1 => loses, but retained
@@ -462,6 +749,205 @@ mod tests {
             r1.apply_remote_content(op.clone());
         }
         assert_eq!(r1.content.get("f").unwrap(), &before, "duplicate merge must be idempotent");
+    }
+
+    #[test]
+    fn name_validation_rejects_bad_names() {
+        let mut d = Drive::init("w", "a");
+        assert!(d.mkdir("/", "").is_err(), "empty name rejected");
+        assert!(d.mkdir("/", "..").is_err(), "dotdot rejected");
+        assert!(d.mkdir("/", "a/b").is_err(), "separator rejected");
+        assert!(d.add_file("/", "x\0y", fc("c", 1)).is_err(), "NUL rejected");
+        assert!(d.add_file("/", &"z".repeat(300), fc("c", 1)).is_err(), "overlong rejected");
+        // A valid name still works after the rejections (no partial state corruption).
+        assert!(d.mkdir("/", "good").is_ok());
+        // mv to a bad name is rejected too.
+        d.add_file("/", "ok.txt", fc("c", 1)).unwrap();
+        assert!(d.mv("/ok.txt", "/", "bad/name").is_err());
+    }
+
+    #[test]
+    fn trash_restore_roundtrip() {
+        let mut d = Drive::init("w", "a");
+        d.mkdir("/", "docs").unwrap();
+        d.add_file("/docs", "a.md", fc("cid1", 10)).unwrap();
+        let id = d.tree.resolve("/docs/a.md").unwrap();
+        d.rm("/docs/a.md").unwrap();
+        assert!(d.ls("/docs").unwrap().is_empty(), "trashed file hidden");
+        // It shows up in the trash listing.
+        let trash = d.trash();
+        assert_eq!(trash.len(), 1);
+        assert_eq!(trash[0].node_id, id);
+        // Restore to a different folder + name.
+        d.restore(&id, Some("/"), Some("restored.md")).unwrap();
+        assert_eq!(d.tree.resolve("/restored.md").as_deref(), Some(id.as_str()));
+        assert!(d.trash().is_empty(), "trash now empty");
+        // Content survived the round-trip.
+        assert_eq!(d.content.get(&id).unwrap().cid, "cid1");
+    }
+
+    #[test]
+    fn restore_rejects_collision_and_non_trashed() {
+        let mut d = Drive::init("w", "a");
+        d.add_file("/", "a.md", fc("c", 1)).unwrap();
+        let id = d.tree.resolve("/a.md").unwrap();
+        // Not in trash yet.
+        assert!(d.restore(&id, None, None).is_err());
+        d.rm("/a.md").unwrap();
+        // Re-create a live file with the same name, then restoring should collide.
+        d.add_file("/", "a.md", fc("c2", 2)).unwrap();
+        assert!(d.restore(&id, Some("/"), Some("a.md")).is_err(), "name collision rejected");
+        // Restoring under a free name works.
+        assert!(d.restore(&id, Some("/"), Some("a-old.md")).is_ok());
+    }
+
+    #[test]
+    fn empty_trash_hard_deletes_and_unpins() {
+        let mut d = Drive::init("w", "a");
+        d.add_file("/", "a.md", fc("cid1", 10)).unwrap();
+        let id = d.tree.resolve("/a.md").unwrap();
+        assert!(d.all_cids().contains(&"cid1".to_string()));
+        d.rm("/a.md").unwrap();
+        let deleted = d.empty_trash();
+        assert_eq!(deleted, vec![id.clone()]);
+        // Gone from trash, content record removed, CID no longer referenced (GC candidate).
+        assert!(d.trash().is_empty());
+        assert!(d.content.get(&id).is_none(), "content record removed");
+        assert!(!d.all_cids().contains(&"cid1".to_string()), "CID unpinned");
+        assert!(d.tree.is_limbo(&id), "node detached to limbo");
+        // Idempotent.
+        assert!(d.empty_trash().is_empty());
+    }
+
+    #[test]
+    fn gc_trash_honors_retention() {
+        let mut d = Drive::init("w", "a");
+        // A file whose content mtime is t=1000ms.
+        d.add_file("/", "old.md", FileContent::new("cid-old", 1, 0o644, 1_000)).unwrap();
+        let old_id = d.tree.resolve("/old.md").unwrap();
+        d.rm("/old.md").unwrap();
+        // now=10 s, retention=5 s => cutoff = 5_000 ms. old.md (mtime 1000ms) is older => GC'd.
+        let gced = d.gc_trash(10, 5);
+        assert_eq!(gced, vec![old_id]);
+        // A freshly-trashed file with a recent mtime is retained.
+        d.add_file("/", "new.md", FileContent::new("cid-new", 1, 0o644, 9_000)).unwrap();
+        d.rm("/new.md").unwrap();
+        let kept = d.gc_trash(10, 5); // cutoff 5_000ms; new.md mtime 9_000ms > cutoff => kept
+        assert!(kept.is_empty(), "recent deletion retained within window");
+        assert_eq!(d.trash().len(), 1);
+    }
+
+    #[test]
+    fn incremental_refold_matches_full_fold() {
+        // Build a content history for several keys via apply_remote_content (incremental path), then
+        // assert the resulting map equals a from-scratch full fold of the same op set.
+        fn cop(l: u64, r: &str, id: &str, cid: &str, mtime: u64) -> StampedContentOp {
+            StampedContentOp {
+                ts: Timestamp::new(l, r),
+                op: ContentOp::Set { id: id.into(), cid: cid.into(), size: 1, mode: 0o644, mtime_ms: mtime },
+            }
+        }
+        let ops = [
+            cop(1, "a", "f", "c1", 100),
+            cop(3, "b", "f", "c3", 300),
+            cop(2, "a", "f", "c2", 200), // arrives out of order (middle insert)
+            cop(2, "b", "g", "cg1", 100),
+            cop(4, "a", "g", "cg2", 50), // older mtime, loses LWW but retained
+        ];
+        let mut d = Drive::init("w", "z");
+        for op in ops.iter().rev() {
+            d.apply_remote_content(op.clone());
+        }
+        let full = fold_content(&d.state.content_log);
+        for id in ["f", "g"] {
+            assert_eq!(d.content.get(id), full.get(id), "incremental refold diverged on '{id}'");
+        }
+        assert_eq!(d.content.get("f").unwrap().cid, "c3", "newest mtime wins");
+    }
+
+    #[test]
+    fn concurrent_content_edit_surfaces_conflict() {
+        // Two writers edit the SAME file id with the SAME mtime but different cids — a genuine
+        // concurrent edit. One wins LWW (cid tiebreak); the loser is surfaced as a conflict copy.
+        fn cop(l: u64, r: &str, id: &str, cid: &str, mtime: u64) -> StampedContentOp {
+            StampedContentOp {
+                ts: Timestamp::new(l, r),
+                op: ContentOp::Set { id: id.into(), cid: cid.into(), size: 1, mode: 0o644, mtime_ms: mtime },
+            }
+        }
+        let mut d = Drive::init("w", "a");
+        // Base content at mtime 1000 (older than the concurrent edits), so the two later edits at the
+        // SAME mtime (2000) are a genuine concurrent edit against each other (not stale history).
+        d.add_file("/", "doc.md", FileContent::new("base", 1, 0o644, 1000)).unwrap();
+        let id = d.tree.resolve("/doc.md").unwrap();
+        // Two concurrent edits with the same mtime (=2000) but different cids.
+        d.apply_remote_content(cop(10, "x", &id, "cid-aaa", 2000));
+        d.apply_remote_content(cop(11, "y", &id, "cid-zzz", 2000));
+        // The conflict surface lists the file with the losing cid as a conflict copy.
+        let conflicts = d.content_conflicts();
+        assert_eq!(conflicts.len(), 1, "one conflicted file");
+        assert_eq!(conflicts[0].path, "/doc.md");
+        // cid-zzz > cid-aaa wins the tiebreak; cid-aaa is the conflict copy.
+        assert_eq!(conflicts[0].current_cid, "cid-zzz");
+        assert!(conflicts[0].conflict_cids.contains(&"cid-aaa".to_string()));
+    }
+
+    #[test]
+    fn sequential_edits_are_not_conflicts() {
+        let mut d = Drive::init("w", "a");
+        d.add_file("/", "doc.md", FileContent::new("v0", 1, 0o644, 100)).unwrap();
+        // Newer mtime each time — ordinary history, no conflict.
+        d.add_file("/", "doc.md", FileContent::new("v1", 1, 0o644, 200)).unwrap();
+        d.add_file("/", "doc.md", FileContent::new("v2", 1, 0o644, 300)).unwrap();
+        assert!(d.content_conflicts().is_empty(), "sequential edits are not conflicts");
+    }
+
+    #[test]
+    fn compact_preserves_live_state_and_shrinks_log() {
+        let mut d = Drive::init("w", "a");
+        d.mkdir("/", "docs").unwrap();
+        d.add_file("/docs", "a.md", fc("cid1", 10)).unwrap();
+        d.add_file("/docs", "a.md", fc("cid2", 20)).unwrap(); // version churn
+        d.add_file("/docs", "a.md", fc("cid3", 30)).unwrap();
+        d.mkdir("/", "tmp").unwrap();
+        d.add_file("/tmp", "junk.txt", fc("junk", 5)).unwrap();
+        d.rm("/tmp/junk.txt").unwrap();
+        d.mv("/docs/a.md", "/", "moved.md").unwrap(); // moves create more ops
+        let before = d.op_count();
+        let live_before = d.ls("/").unwrap();
+        let docs_before = d.ls("/docs").unwrap();
+        let content_before = {
+            let id = d.tree.resolve("/moved.md").unwrap();
+            d.content.get(&id).unwrap().clone()
+        };
+
+        d.compact();
+        // Live listings are identical after compaction.
+        assert_eq!(d.ls("/").unwrap(), live_before);
+        assert_eq!(d.ls("/docs").unwrap(), docs_before);
+        // Current content + full version history preserved for the live file.
+        let id = d.tree.resolve("/moved.md").unwrap();
+        assert_eq!(d.content.get(&id).unwrap().cid, content_before.cid);
+        assert_eq!(d.content.get(&id).unwrap().cid, "cid3");
+        // Trashed junk is gone (compaction is the GC boundary).
+        assert!(d.trash().is_empty());
+        assert!(!d.all_cids().contains(&"junk".to_string()));
+        // The log got smaller (history churn collapsed).
+        assert!(d.op_count() < before, "compaction shrinks the op log: {} < {}", d.op_count(), before);
+        // And the compacted state replays identically from scratch.
+        let replayed = Drive::from_state(d.state().clone());
+        assert_eq!(replayed.ls("/").unwrap(), d.ls("/").unwrap());
+    }
+
+    #[test]
+    fn changes_since_reports_deltas() {
+        let mut d = Drive::init("w", "a");
+        d.add_file("/", "a.txt", fc("c1", 1)).unwrap();
+        let head = d.changes_head();
+        d.mkdir("/", "docs").unwrap();
+        let (changes, _) = d.changes_since(&head, 0);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0].kind, crate::changes::ChangeKind::Created { is_dir: true }));
     }
 
     #[test]

@@ -106,6 +106,47 @@ enum Cmd {
         /// Mountpoint directory.
         mountpoint: PathBuf,
     },
+    /// List the trash (deleted-but-recoverable nodes).
+    Trash,
+    /// Restore a trashed node back to a live location.
+    Restore {
+        /// The node id of the trashed item (from `trash`).
+        node_id: String,
+        /// Destination directory (defaults to `/`).
+        #[arg(long)]
+        to: Option<String>,
+        /// New name (defaults to its original name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Permanently delete trashed nodes. Without `--older-than`, empties the whole trash; with it,
+    /// only nodes whose newest content is older than the given seconds are hard-deleted (GC).
+    EmptyTrash {
+        /// Only GC nodes whose content mtime is older than this many seconds (0 = empty all).
+        #[arg(long, default_value_t = 0)]
+        older_than: u64,
+    },
+    /// Search files and folders by name/path (case-folded, substring + trigram).
+    Search {
+        /// The query string.
+        query: String,
+        /// Maximum number of hits (0 = unbounded).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Show changes since a cursor (a unix-ms `lamport:replica` cursor, or empty for full history).
+    Changes {
+        /// Resume cursor as `lamport:replica` (omit to replay all history).
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum number of changes (0 = unbounded).
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
+    /// List files with unresolved concurrent-edit conflicts (Dropbox-style `.conflict` copies).
+    Conflicts,
+    /// Compact the persisted op log to a minimal equivalent (bounds state-file size + replay time).
+    Compact,
 }
 
 #[tokio::main]
@@ -133,13 +174,20 @@ async fn main() -> Result<()> {
         Cmd::Materialize { out } => cmd_materialize(&paths, &cli.node, &out).await,
         Cmd::Push { dir, watch, interval } => cmd_push(&paths, &cli.node, &dir, watch, interval).await,
         Cmd::Mount { mountpoint } => cmd_mount(&paths, &cli.node, &mountpoint).await,
+        Cmd::Trash => cmd_trash(&paths),
+        Cmd::Restore { node_id, to, name } => cmd_restore(&paths, &node_id, to, name),
+        Cmd::EmptyTrash { older_than } => cmd_empty_trash(&paths, older_than),
+        Cmd::Search { query, limit } => cmd_search(&paths, &query, limit),
+        Cmd::Changes { since, limit } => cmd_changes(&paths, since, limit),
+        Cmd::Conflicts => cmd_conflicts(&paths),
+        Cmd::Compact => cmd_compact(&paths),
     }
 }
 
 // ---- commands ----
 
 async fn cmd_init(paths: &Paths) -> Result<()> {
-    if paths.state_file.exists() {
+    if paths.exists() {
         bail!("drive '{}' already exists at {}", paths.name, paths.state_file.display());
     }
     let identity = paths.identity()?;
@@ -446,11 +494,133 @@ async fn cmd_mount(paths: &Paths, node: &str, mountpoint: &Path) -> Result<()> {
     }
 }
 
+fn cmd_trash(paths: &Paths) -> Result<()> {
+    let drive = paths.load()?;
+    let items = drive.trash();
+    if items.is_empty() {
+        println!("trash is empty");
+        return Ok(());
+    }
+    for e in items {
+        let size = e.content.as_ref().map(|c| c.size).unwrap_or(0);
+        let kind = if e.is_dir { "dir " } else { "file" };
+        println!("{}\t{kind}\t{}\t{} bytes", e.node_id, e.name, size);
+    }
+    println!("\nrestore with: ce-drive restore <node_id> [--to /dir] [--name new]");
+    Ok(())
+}
+
+fn cmd_restore(paths: &Paths, node_id: &str, to: Option<String>, name: Option<String>) -> Result<()> {
+    let mut drive = paths.load()?;
+    drive.restore(node_id, to.as_deref(), name.as_deref())?;
+    paths.save(&drive)?;
+    let path = drive.path_of(node_id).unwrap_or_else(|| node_id.to_string());
+    println!("restored {node_id} -> {path}");
+    Ok(())
+}
+
+fn cmd_empty_trash(paths: &Paths, older_than: u64) -> Result<()> {
+    let mut drive = paths.load()?;
+    let removed = if older_than == 0 {
+        drive.empty_trash()
+    } else {
+        drive.gc_trash(now_secs(), older_than)
+    };
+    paths.save(&drive)?;
+    println!("hard-deleted {} node(s)", removed.len());
+    for id in &removed {
+        println!("  {id}");
+    }
+    Ok(())
+}
+
+fn cmd_search(paths: &Paths, query: &str, limit: usize) -> Result<()> {
+    let drive = paths.load()?;
+    let idx = drive.search_index();
+    let hits = idx.search(query, limit);
+    if hits.is_empty() {
+        println!("no matches for '{query}'");
+        return Ok(());
+    }
+    for h in hits {
+        let kind = if h.is_dir { "dir " } else { "file" };
+        println!("{:.1}\t{kind}\t{}\t({} bytes)", h.score, h.path, h.size);
+    }
+    Ok(())
+}
+
+fn cmd_changes(paths: &Paths, since: Option<String>, limit: usize) -> Result<()> {
+    use ce_drive_core::changes::Cursor;
+    use ce_drive_core::tree::Timestamp;
+    let drive = paths.load()?;
+    let cursor = match since {
+        None => Cursor::beginning(),
+        Some(s) => {
+            let (l, r) = s
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("--since must be 'lamport:replica' (e.g. 42:abcd...)"))?;
+            let lamport: u64 = l.parse().context("parse lamport in --since cursor")?;
+            Cursor::at(Timestamp::new(lamport, r))
+        }
+    };
+    let (changes, next) = drive.changes_since(&cursor, limit);
+    for c in &changes {
+        let what = match &c.kind {
+            ce_drive_core::changes::ChangeKind::Created { is_dir } => {
+                if *is_dir { "created-dir".to_string() } else { "created".to_string() }
+            }
+            ce_drive_core::changes::ChangeKind::Moved => "moved".to_string(),
+            ce_drive_core::changes::ChangeKind::Trashed => "trashed".to_string(),
+            ce_drive_core::changes::ChangeKind::ContentChanged { size, .. } => {
+                format!("content ({size} bytes)")
+            }
+            ce_drive_core::changes::ChangeKind::ContentRemoved => "content-removed".to_string(),
+        };
+        let path = c.path.clone().or_else(|| c.name.clone()).unwrap_or_else(|| c.node_id.clone());
+        println!("{}:{}\t{what}\t{path}", c.ts.lamport, &c.ts.replica[..8.min(c.ts.replica.len())]);
+    }
+    if let Some(ts) = &next.last {
+        println!("\nnext cursor: {}:{}", ts.lamport, ts.replica);
+    } else {
+        println!("\n(no changes)");
+    }
+    Ok(())
+}
+
+fn cmd_conflicts(paths: &Paths) -> Result<()> {
+    let drive = paths.load()?;
+    let conflicts = drive.content_conflicts();
+    if conflicts.is_empty() {
+        println!("no content conflicts");
+        return Ok(());
+    }
+    for c in conflicts {
+        println!("{}  (current cid {})", c.path, &c.current_cid[..16.min(c.current_cid.len())]);
+        for cc in &c.conflict_cids {
+            println!("  conflict copy: {}.conflict-{}", c.path, &cc[..8.min(cc.len())]);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_compact(paths: &Paths) -> Result<()> {
+    let mut drive = paths.load()?;
+    let before = drive.op_count();
+    drive.compact();
+    let after = drive.op_count();
+    paths.save(&drive)?;
+    println!("compacted op log: {before} -> {after} ops");
+    Ok(())
+}
+
 // ---- paths / persistence ----
 
 struct Paths {
     name: String,
+    /// The canonical compact state file (`<name>.cedrive`, bincode+zstd).
     state_file: PathBuf,
+    /// A legacy pretty-JSON state file (`<name>.json`) from earlier versions, migrated on first read.
+    legacy_json: PathBuf,
     journal_file: PathBuf,
     identity_dir: PathBuf,
 }
@@ -468,10 +638,16 @@ impl Paths {
             .unwrap_or_else(|| base.join("identity"));
         Ok(Paths {
             name: name.to_string(),
-            state_file: base.join(format!("{name}.json")),
+            state_file: base.join(format!("{name}.cedrive")),
+            legacy_json: base.join(format!("{name}.json")),
             journal_file: base.join(format!("{name}.audit.json")),
             identity_dir,
         })
+    }
+
+    /// True if this drive already has a persisted state (compact or legacy).
+    fn exists(&self) -> bool {
+        self.state_file.exists() || self.legacy_json.exists()
     }
 
     fn identity(&self) -> Result<Identity> {
@@ -480,20 +656,47 @@ impl Paths {
     }
 
     fn load(&self) -> Result<Drive> {
-        let bytes = std::fs::read(&self.state_file)
-            .with_context(|| format!("drive '{}' not found — run `ce-drive init` (looked at {})", self.name, self.state_file.display()))?;
-        let state: DriveState = serde_json::from_slice(&bytes).context("parse drive state")?;
+        let state = self.load_state()?;
         Ok(Drive::from_state(state))
+    }
+
+    /// Load a [`DriveState`], preferring the compact bincode+zstd `.cedrive` file and transparently
+    /// migrating a legacy pretty-JSON `.json` state on first read (so older drives keep working).
+    fn load_state(&self) -> Result<DriveState> {
+        // Preferred: compact bincode+zstd.
+        if self.state_file.exists() {
+            let bytes = std::fs::read(&self.state_file)
+                .with_context(|| format!("read {}", self.state_file.display()))?;
+            return decode_state(&bytes);
+        }
+        // Legacy migration: a pretty-JSON state from an earlier version.
+        if self.legacy_json.exists() {
+            let s = std::fs::read_to_string(&self.legacy_json)
+                .with_context(|| format!("read {}", self.legacy_json.display()))?;
+            let state: DriveState = serde_json::from_str(&s).context("parse legacy JSON drive state")?;
+            return Ok(state);
+        }
+        bail!(
+            "drive '{}' not found — run `ce-drive init` (looked at {})",
+            self.name,
+            self.state_file.display()
+        )
     }
 
     fn save(&self, drive: &Drive) -> Result<()> {
         self.save_state(drive.state())
     }
 
-    /// Persist a [`DriveState`] directly (the mount-unmount path hands back a state, not a `Drive`).
+    /// Persist a [`DriveState`] as bincode+zstd (per project standards: deterministic, compact). The
+    /// write is atomic (temp + fsync + rename). A legacy `.json` file is removed after a successful
+    /// migration so the drive is single-sourced going forward.
     fn save_state(&self, state: &DriveState) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(state).context("serialize drive state")?;
-        write_atomic(&self.state_file, &bytes)
+        let bytes = encode_state(state)?;
+        write_atomic(&self.state_file, &bytes)?;
+        if self.legacy_json.exists() {
+            let _ = std::fs::remove_file(&self.legacy_json);
+        }
+        Ok(())
     }
 
     /// A minimal clone of the persistence handle (the unmount callback is `move` and outlives the
@@ -503,6 +706,7 @@ impl Paths {
         Paths {
             name: self.name.clone(),
             state_file: self.state_file.clone(),
+            legacy_json: self.legacy_json.clone(),
             journal_file: self.journal_file.clone(),
             identity_dir: self.identity_dir.clone(),
         }
@@ -520,9 +724,43 @@ impl Paths {
     }
 }
 
+/// A magic+version header so a `.cedrive` file is self-describing and a truncated/garbage file is
+/// rejected with a clear error rather than a confusing bincode failure.
+const CEDRIVE_MAGIC: &[u8; 8] = b"CEDRIVE1";
+
+/// Encode a [`DriveState`] as `magic || bincode(state)` compressed with zstd level 3 (the project's
+/// persistence standard: deterministic, compact). The magic is prepended *before* compression so the
+/// decoder can sanity-check the decompressed payload.
+fn encode_state(state: &DriveState) -> Result<Vec<u8>> {
+    let body = bincode::serialize(state).context("bincode-encode drive state")?;
+    let mut framed = Vec::with_capacity(body.len() + CEDRIVE_MAGIC.len());
+    framed.extend_from_slice(CEDRIVE_MAGIC);
+    framed.extend_from_slice(&body);
+    zstd::stream::encode_all(framed.as_slice(), 3).context("zstd-compress drive state")
+}
+
+/// Decode a `.cedrive` blob produced by [`encode_state`]. Validates the magic header so a corrupt or
+/// foreign file fails loudly instead of silently deserializing garbage.
+fn decode_state(bytes: &[u8]) -> Result<DriveState> {
+    let framed = zstd::stream::decode_all(bytes).context("zstd-decompress drive state")?;
+    if framed.len() < CEDRIVE_MAGIC.len() || &framed[..CEDRIVE_MAGIC.len()] != CEDRIVE_MAGIC {
+        bail!("not a valid .cedrive file (bad magic header) — refusing to load corrupt state");
+    }
+    bincode::deserialize(&framed[CEDRIVE_MAGIC.len()..]).context("bincode-decode drive state")
+}
+
+/// Atomically write `bytes` to `path`: write a sibling temp file, fsync it, then rename over the
+/// target (rename is atomic on POSIX). A crash mid-write leaves either the old file or the new file
+/// fully intact, never a truncated one.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    {
+        let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(bytes).with_context(|| format!("write {}", tmp.display()))?;
+        f.flush().with_context(|| format!("flush {}", tmp.display()))?;
+        f.sync_all().with_context(|| format!("fsync {}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
     Ok(())
 }
@@ -570,5 +808,62 @@ fn join(dir: &str, name: &str) -> String {
         format!("/{name}")
     } else {
         format!("{}/{name}", dir.trim_end_matches('/'))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ce_drive_core::content::FileContent;
+
+    fn sample_state() -> DriveState {
+        let mut d = Drive::init("t", "replica-x");
+        d.mkdir("/", "docs").unwrap();
+        d.add_file("/docs", "a.md", FileContent::new("cid-a", 10, 0o644, 1)).unwrap();
+        d.state().clone()
+    }
+
+    #[test]
+    fn encode_decode_roundtrips() {
+        let state = sample_state();
+        let bytes = encode_state(&state).unwrap();
+        // It is real binary (zstd), not JSON.
+        assert_ne!(bytes.first(), Some(&b'{'));
+        let back = decode_state(&bytes).unwrap();
+        // A re-encode is byte-identical (deterministic), and the replayed tree matches.
+        assert_eq!(encode_state(&back).unwrap(), bytes);
+        assert_eq!(
+            Drive::from_state(back).ls("/docs").unwrap(),
+            Drive::from_state(state).ls("/docs").unwrap()
+        );
+    }
+
+    #[test]
+    fn decode_rejects_garbage_and_bad_magic() {
+        // Random bytes are not valid zstd -> error (not a panic).
+        assert!(decode_state(b"not zstd at all").is_err());
+        // Valid zstd but without our magic header -> rejected by the magic check.
+        let no_magic = zstd::stream::encode_all(&b"hello world payload"[..], 3).unwrap();
+        let err = decode_state(&no_magic).unwrap_err().to_string();
+        assert!(err.contains("magic") || err.contains("decode"), "got: {err}");
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.cedrive");
+        write_atomic(&p, b"first").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"first");
+        // Overwrite atomically; no leftover .tmp file.
+        write_atomic(&p, b"second-longer").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"second-longer");
+        assert!(!p.with_extension("tmp").exists(), "temp file is renamed away");
+    }
+
+    #[test]
+    fn split_path_rejects_root() {
+        assert!(split_path("/").is_err());
+        assert_eq!(split_path("/a/b.txt").unwrap(), ("/a".to_string(), "b.txt".to_string()));
+        assert_eq!(split_path("/top.txt").unwrap(), ("/".to_string(), "top.txt".to_string()));
     }
 }
