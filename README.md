@@ -6,10 +6,43 @@
 
 CE Drive is **one core, two faces**: a content-addressed, dedup'd, naturally-versioned storage model
 with a Kleppmann move-CRDT directory tree, presented as (1) a cross-platform developer **mount** and
-(2) a Drive/Workspace **web app**. The core compiles to **WASM** for the in-browser node.
+(2) a Drive/Workspace **web app** (the sibling [`ce-drive-web`](../ce-drive-web) repo). The core
+compiles to **WASM** for the in-browser node.
 
 See [`docs/architecture.md`](docs/architecture.md) for how the model works and why it converges, and
 [`CHANGELOG.md`](CHANGELOG.md) for what is new.
+
+## The reference mesh-native app
+
+**CE Drive is the canonical reference for the `ce-app` mesh-native frontend flow** — the richest app
+in the workspace, and the one to copy when building a new CE web app. Everything a served frontend
+needs (data, realtime, capabilities/auth, content) flows through the user's **local node, same-origin
+only** — no central server, no `ce-net.com/db`, `ce-net.com/rt`, `cast.*`, or `auth.*`, no cross-origin
+`fetch`/`WebSocket`/`EventSource`. This holds under the strict CSP (`default-src 'self'; connect-src
+'self'; …`).
+
+`ce-drive-web` is the web face. It connects via the SDK's `connectNode()` (from `@ce-net/sdk`), which
+auto-selects a same-origin transport — the in-browser node bridge (`window.__ceNode`) when present,
+else a same-origin reverse proxy at `/ce` to the local node (`127.0.0.1:8844`). File **bytes** ride
+the node's content-addressed `/blobs` layer (chunked, per-chunk CID-verified); the **directory tree /
+versions / conflicts** are the real `ce-drive-wasm` move-CRDT run in the browser; **multi-device
+convergence** rides a per-drive mesh merged-log topic over the node's `/mesh/*` pub/sub; **share /
+revoke** wire to the node's `ce-cap` surface.
+
+Ship it over mesh ingress with the standard three commands (run from `ce-drive-web/`, or from this
+repo with `--sub web` if `ce-drive-web` is vendored as `./web`):
+
+```bash
+ce-app register                                          # claim the app's name on-chain + advertise (no hub index)
+ce-app serve   --sub web                                 # build dist/ + static host: inject CSP + bridge + same-origin /ce proxy
+ce-app expose  --domain drive-<nodeprefix> --sub web     # ce-expose ORIGIN agent → https://drive-<nodeprefix>.user.ce-net.com
+```
+
+`<nodeprefix>` is the leading bytes of this node's ID (see `ce id` / `ce-app register`), so the public
+name is per-node, e.g. `https://drive-25df8f15.user.ce-net.com`. `ce-net.com` is **dumb mesh HTTP
+ingress** — the served bytes and every runtime call stay same-origin to the user's local node. See
+[`ce-drive-web/README.md`](../ce-drive-web/README.md) for the full web-app architecture and the
+`DriveCore` seam.
 
 ## Crates
 
@@ -119,8 +152,10 @@ The product vision and milestone sequencing (two faces, web app, E2E encryption,
 The shipped model is described in [`docs/architecture.md`](docs/architecture.md).
 
 ### Deferred (real slices shipped, full feature later)
-- **Drive web app** (`ce-drive serve` + React on the wasm CRDT) — the core, change feed, and search
-  APIs that back it are shipped; the HTTP server and frontend are the remaining work.
+- **Drive web app** — **shipped** as the sibling [`ce-drive-web`](../ce-drive-web) repo: a
+  framework-free TS + Vite SPA on the wasm CRDT, served and exposed over the mesh via `ce-app`
+  (see [The reference mesh-native app](#the-reference-mesh-native-app)). Remaining: thumbnails,
+  collaborative `.cedoc`, and at-rest E2E (the reserved hooks below).
 - **Full-text content search** — the filename/path index ships with an `add_text` content hook; an
   automatic text-extraction/indexing pipeline over fetched blobs is deferred.
 - **Thumbnails / previews, at-rest E2E encryption envelope, collaborative `.cedoc`, quota/billing** —
