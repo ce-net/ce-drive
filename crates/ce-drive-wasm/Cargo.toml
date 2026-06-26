@@ -3,7 +3,7 @@ name = "ce-drive-wasm"
 version = "0.1.0"
 edition = "2024"
 description = "CE Drive WASM CRDT core — the PURE, I/O-free move-CRDT directory tree + content/version model + path resolution + conflict info, compiled to wasm32 via wasm-bindgen for the in-browser CE node. Holds only the deterministic CRDT state machine + serde; it ingests opaque ops (bytes) the browser fetches via @ce-net/sdk and manages the tree + metadata. File BYTES are never in wasm."
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/ce-net/ce-drive"
 
 [lib]

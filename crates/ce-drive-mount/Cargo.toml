@@ -3,7 +3,7 @@ name = "ce-drive-mount"
 version = "0.1.0"
 edition = "2024"
 description = "CE Drive mount (Face 1) — the developer filesystem. A shared VFS engine (lazy block hydration, write-back cache with async upload, stable inodes, readdirplus, atomic rename, attr/entry TTLs) plus per-OS adapters (fuser Linux behind the `fuse` feature; macFUSE-FSKit and WinFsp/ProjFS stubs) and a driverless `materialize` fallback that works everywhere with no kernel driver."
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/ce-net/ce-drive"
 
 [lib]

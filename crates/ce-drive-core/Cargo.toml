@@ -3,7 +3,7 @@ name = "ce-drive-core"
 version = "0.1.0"
 edition = "2024"
 description = "CE Drive core — the Kleppmann move-CRDT directory tree, content-addressed chunked storage, capability sharing, durability, and audit. A pure library over CE primitives (ce-coord, ce-rs, ce-cap, rdev::chunk). Compiles to WASM."
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/ce-net/ce-drive"
 
 [lib]
