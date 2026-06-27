@@ -47,6 +47,13 @@ jobs:
           repository: ce-net/ce
           path: ce
 
+      # Path dependency: ce-iam-core lives inside ce-net/ce-iam (../ce-iam/crates/ce-iam-core)
+      - name: Checkout ce-iam
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-iam
+          path: ce-iam
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
