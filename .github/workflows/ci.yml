@@ -54,6 +54,13 @@ jobs:
           repository: ce-net/ce-iam
           path: ce-iam
 
+      # Transitive path dependency: ce-iam-core depends on ce-secrets-rs (../ce-secrets-rs)
+      - name: Checkout ce-secrets-rs
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-secrets-rs
+          path: ce-secrets-rs
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
