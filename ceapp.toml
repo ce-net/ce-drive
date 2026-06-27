@@ -1,0 +1,22 @@
+# ce-drive — the CE Drive developer CLI (init/add/ls/tree/mv/rm/history/share/sync/mount). Installed + supervised by the one `ce` node via ce-appmgr.
+
+[app]
+name    = "ce-drive"
+version = "0.1.0"
+summary = "CE Drive CLI: single-writer move-CRDT drive on disk, content-addressed chunked storage, cap sharing, materialize/mount."
+runtime = "native"
+publisher = "c0be11e0ce0aaa769da6f9970244947d3d32a0c0d8302fb5f41f73d7950be456"
+
+[native]
+bin = "ce-drive"
+[native.artifacts]
+"darwin-amd64" = "PLACEHOLDER_darwin_amd64"
+"linux-amd64"  = "PLACEHOLDER_linux_amd64"
+
+[deps]
+# Local CE node (blob storage + mesh) for add/sync; workspace identity mints ce-cap share grants.
+
+[sandbox]
+tier       = "none"
+net        = "loopback"
+capability = "inherit"

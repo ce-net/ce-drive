@@ -11,7 +11,7 @@ members = ["crates/ce-drive-core", "crates/ce-drive-wasm", "crates/ce-drive-cli"
 ce-rs = { path = "../ce-rs" }
 
 [patch."https://github.com/ce-net/ce"]
-ce-cap = { path = "../ce/crates/ce-cap" }
+ce-iam-core = { path = "../ce-iam/crates/ce-iam-core" }
 ce-container = { path = "../ce/crates/ce-container" }
 ce-identity = { path = "../ce/crates/ce-identity" }
 
