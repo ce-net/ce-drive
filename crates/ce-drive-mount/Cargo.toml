@@ -27,7 +27,7 @@ macos-fskit = ["dep:fuser", "dep:libc"]
 [dependencies]
 # --- CE Drive core (the DriveTree + content map + store we mount) ---
 ce-drive-core = { path = "../ce-drive-core" }
-ce-rs = { path = "../../../ce-rs" }
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }
 
 # --- async + error + serde + logging ---
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "fs"] }

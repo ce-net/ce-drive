@@ -8,12 +8,12 @@ members = ["crates/ce-drive-core", "crates/ce-drive-wasm", "crates/ce-drive-cli"
 # Redirecting the git URL to the local path collapses the graph onto ONE `ce-rs` (one `CeClient`,
 # one `data::Manifest`, one `cid`). This is the same trick ce-notes uses.
 [patch."https://github.com/ce-net/ce-rs"]
-ce-rs = { path = "../ce-rs" }
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }
 
 [patch."https://github.com/ce-net/ce"]
-ce-iam-core = { path = "../ce-iam/crates/ce-iam-core" }
-ce-container = { path = "../ce/crates/ce-container" }
-ce-identity = { path = "../ce/crates/ce-identity" }
+ce-iam-core = { git = "https://github.com/ce-net/ce-iam" }
+ce-container = { git = "https://github.com/ce-net/ce" }
+ce-identity = { git = "https://github.com/ce-net/ce" }
 
 [profile.release]
 opt-level = 3

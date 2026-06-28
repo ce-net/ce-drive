@@ -12,11 +12,11 @@ path = "src/lib.rs"
 
 [dependencies]
 # --- CE substrate (siblings in the ~/ce-net workspace; by path) ---
-ce-rs = { path = "../../../ce-rs" }                      # blob/object data layer + mesh transport
-ce-coord = { path = "../../../ce-coord" }                # Replicated<S> / StateMachine engine
-ce-cap = { path = "../../../ce/crates/ce-cap" }          # capability verifier (sharing/authorization)
-ce-identity = { path = "../../../ce/crates/ce-identity" } # Ed25519 identity (workspace root key)
-rdev = { path = "../../../rdev" }                        # the chunk/CID delta engine (chunk + delta)
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }                      # blob/object data layer + mesh transport
+ce-coord = { git = "https://github.com/ce-net/ce-coord" }                # Replicated<S> / StateMachine engine
+ce-cap = { git = "https://github.com/ce-net/ce" }          # capability verifier (sharing/authorization)
+ce-identity = { git = "https://github.com/ce-net/ce" } # Ed25519 identity (workspace root key)
+rdev = { git = "https://github.com/ce-net/rdev" }                        # the chunk/CID delta engine (chunk + delta)
 
 # --- async + error + serde ---
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
@@ -31,7 +31,7 @@ tracing = "0.1"
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
-ce-identity = { path = "../../../ce/crates/ce-identity" }
+ce-identity = { git = "https://github.com/ce-net/ce" }
 # The two-node sync integration test boots real nodes and fetches /bootstrap over HTTP. Same feature
 # set as ce-rs so the reqwest build unifies.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
